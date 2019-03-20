@@ -1,6 +1,4 @@
-﻿
-
-import kotlinx.coroutines.*
+﻿import kotlinx.coroutines.*
 import kotlinx.coroutines.channels.*
 import kotlin.system.measureTimeMillis
 
@@ -38,10 +36,6 @@ class Replica(shouldCommit : Boolean) : Node() {
         }
     }
 
-    fun addLeader(leader_ : Leader) = {
-        leader = leader_
-    }
-
     suspend fun commitOrAbortFromLeader() = channelToLeader.receive().toBoolean()
 
     suspend fun commitOrAbort(value : Boolean) = channelToLeader.send(value.toInt())
@@ -57,7 +51,6 @@ class Replica(shouldCommit : Boolean) : Node() {
     fun Boolean.toInt() = if (this) 1 else 0
     fun Int.toBoolean() = if (this == 1) true else false
 
-    var leader : Leader? = null
     val shouldCommit = shouldCommit
     val channelToLeader = Channel<Int>()
 }
@@ -88,16 +81,14 @@ class Leader(replicas : List<Replica>, proposed : Int) : Node() {
 
 fun oneLeaderOneReplicaScenarioWithConsensus() = runBlocking<Unit> {
     val replica = Replica(true)
-        val leader = Leader(listOf(replica), 123)
-    replica.addLeader(leader)
+    val leader = Leader(listOf(replica), 123)
     launch { replica.run() }
     launch { leader.run() }
 }
 
 fun oneLeaderOneReplicaScenarioNoConsensus() = runBlocking<Unit> {
     val replica = Replica(false)
-        val leader = Leader(listOf(replica), 123)
-    replica.addLeader(leader)
+    val leader = Leader(listOf(replica), 123)
     launch { replica.run() }
     launch { leader.run() }
 }
