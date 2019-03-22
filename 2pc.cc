@@ -1,6 +1,7 @@
 #include <experimental/thread_pool>
 #include <iostream>
 #include <cassert>
+#include <type_traits>
 
 // TODO: without mutable and move it's ill-formed with wall of text :(
 
@@ -49,9 +50,6 @@ public:
         result.get();
     }
 
-private:
-    const bool should_commit;
-
     future<int> read() {
         promise<int> p;
         p.set_value(42);
@@ -63,7 +61,37 @@ private:
         p.set_value(24);
         return p.get_future();
     }
+
+private:
+    const bool should_commit;
 };
+
+template<typename T>
+struct extract
+{
+    using value_type = T;
+};
+
+template<template<typename, typename ...> class X, typename T, typename ...Args>
+struct extract<X<T, Args...>>
+{
+    using value_type = T;
+};
+
+template<class FuturesContainer>
+inline auto
+when_all(FuturesContainer &&container) {
+    using Fut = std::decay_t<typename FuturesContainer::value_type>;
+    if (std::all_of(container.begin(), container.end(),
+                    [](auto &&f) {
+                        return f.is_ready(); })) {
+        promise<FuturesContainer> p;
+        p.set_value(std::move(container));
+        return p.get_future();
+    } else {
+        throw;
+    }
+}
 
 class Leader final : public Node {
 public:
@@ -72,9 +100,43 @@ public:
     void run() override {
         assert(state == State::INITIAL);
         state = State::PROPOSE;
+        std::vector<future<int>> channels;
+        for (auto &&replica : replicas) {
+            channels.emplace_back(replica.write(proposed));
+        }
+        auto result = when_all(std::move(channels)).then([this](auto channels_) mutable {
+            auto channels = channels_.get();
+            channels.clear();
+            state = State::VOTE;
+            for (auto &&replica : replicas) {
+                channels.emplace_back(replica.read());
+            }
+            return when_all(std::move(channels)).then([this](auto channels_) mutable {
+                auto channels = channels_.get();
+                channels.clear();
+                state = State::COMMIT_OR_ABORT;
+                auto maybe_commit = std::all_of(channels.begin(), channels.end(), [](auto &&f){
+                    return static_cast<bool>(f.get());
+                });
+                for (auto &&replica : replicas) {
+                    channels.emplace_back(replica.write(maybe_commit));
+                }
+                return when_all(std::move(channels)).then([this, maybe_commit](auto channels) mutable noexcept {
+                    if (maybe_commit) {
+                        register_ = proposed;
+                        std::cout << "Replica: Value := " << register_ << "\n";
+                    } else {
+                        std::cout << "No consensus\n";
+                    }
+                    state = State::INITIAL;
+                    return std::move(channels);
+                });
+            });
+        });
+        result.get();
     }
 private:
-    const std::vector<Replica> replicas;
+    std::vector<Replica> replicas;
     const int proposed;
 };
 
@@ -95,7 +157,7 @@ static auto minimal_then_test() {
 static auto one_leader_one_replica_scenario_with_consensus() {
     auto replica = Replica(true);
     auto leader = Leader({replica}, 123);
-    replica.run();
+    //replica.run();
     leader.run();
 }
 
