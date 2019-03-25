@@ -93,7 +93,23 @@ fun oneLeaderOneReplicaScenarioNoConsensus() = runBlocking<Unit> {
     launch { leader.run() }
 }
 
+fun oneLeaderReplicasScenarioWithConsensus() = runBlocking<Unit> {
+    val replicas = listOf(Replica(true), Replica(true), Replica(true), Replica(true), Replica(true), Replica(true), Replica(true),
+                         Replica(true), Replica(true), Replica(true), Replica(true), Replica(true), Replica(true))
+    val leader = Leader(replicas, 321)
+    launch { leader.run() }
+    replicas.forEach { launch { it.run() } }
+}
+
+fun oneLeaderReplicasScenarioWithNoConsensus() = runBlocking<Unit> {
+    val replicas = listOf(Replica(true), Replica(true), Replica(true), Replica(true), Replica(true), Replica(true), Replica(true),
+                         Replica(true), Replica(true), Replica(true), Replica(true), Replica(true), Replica(true), Replica(false))
+    val leader = Leader(replicas, 321)
+    launch { leader.run() }
+    replicas.forEach { launch { it.run() } }
+}
+
 fun main(args: Array<String>) {
-    oneLeaderOneReplicaScenarioWithConsensus()
-    oneLeaderOneReplicaScenarioNoConsensus()
+    oneLeaderReplicasScenarioWithConsensus()
+    oneLeaderReplicasScenarioWithNoConsensus()
 }
