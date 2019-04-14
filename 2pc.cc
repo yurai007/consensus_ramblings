@@ -1,7 +1,9 @@
-#include <experimental/thread_pool>
+﻿#include <experimental/thread_pool>
 #include <iostream>
 #include <cassert>
 #include <type_traits>
+#include <stdexcept>
+#include <boost/range/algorithm/for_each.hpp>
 
 // TODO: without mutable and move it's ill-formed with wall of text :(
 
@@ -11,6 +13,45 @@ template<class T>
 using future = execution::executor_future_t<static_thread_pool::executor_type, T>;
 template<class T>
 using promise = std::experimental::executors_v1::promise<T>;
+
+template <typename T>
+struct is_future : std::true_type {};
+
+//template <typename T>
+//struct is_future<future<T>> : std::true_type {};
+
+#ifndef __clang__
+template <typename T>
+concept bool Future = is_future<T>::value;
+
+template<class FuturesContainer>
+requires requires (FuturesContainer c) {
+    std::begin(c);
+    std::end(c);
+    is_future<decltype(*std::begin(c))>::value;
+}
+inline auto
+when_all(FuturesContainer &&container) {
+    using Fut = std::decay_t<typename FuturesContainer::value_type>;
+    if (std::all_of(container.begin(), container.end(),
+                    [](auto &&f) {
+                        return f.is_ready(); })) {
+        promise<FuturesContainer> p;
+        p.set_value(std::move(container));
+        return p.get_future();
+    } else {
+        throw std::runtime_error("");
+    }
+}
+#endif
+
+template<class T>
+[[nodiscard]]
+inline auto make_ready_future(T &&value) {
+    promise<T> p;
+    p.set_value(value);
+    return p.get_future();
+}
 
 enum class State {
     INITIAL, PROPOSE, VOTE, COMMIT_OR_ABORT
@@ -51,47 +92,16 @@ public:
     }
 
     future<int> read() {
-        promise<int> p;
-        p.set_value(42);
-        return p.get_future();
+        return make_ready_future<>(42);
     }
 
     future<int> write(int) {
-        promise<int> p;
-        p.set_value(24);
-        return p.get_future();
+       return make_ready_future<>(24);
     }
 
 private:
     const bool should_commit;
 };
-
-template<typename T>
-struct extract
-{
-    using value_type = T;
-};
-
-template<template<typename, typename ...> class X, typename T, typename ...Args>
-struct extract<X<T, Args...>>
-{
-    using value_type = T;
-};
-
-template<class FuturesContainer>
-inline auto
-when_all(FuturesContainer &&container) {
-    using Fut = std::decay_t<typename FuturesContainer::value_type>;
-    if (std::all_of(container.begin(), container.end(),
-                    [](auto &&f) {
-                        return f.is_ready(); })) {
-        promise<FuturesContainer> p;
-        p.set_value(std::move(container));
-        return p.get_future();
-    } else {
-        throw;
-    }
-}
 
 class Leader final : public Node {
 public:
@@ -157,12 +167,20 @@ static auto minimal_then_test() {
 static auto one_leader_one_replica_scenario_with_consensus() {
     auto replica = Replica(true);
     auto leader = Leader({replica}, 123);
-    //replica.run();
+    replica.run();
+    leader.run();
+}
+
+static auto one_leader_more_replicas_scenario_no_consensus() {
+    auto reps = std::vector<Replica>{Replica(true), Replica(false), Replica(true)};
+    auto leader = Leader(reps, 123);
+    boost::range::for_each(reps, [](auto &&rep){ rep.run(); });
     leader.run();
 }
 
 int main() {
     minimal_then_test();
     one_leader_one_replica_scenario_with_consensus();
+    one_leader_more_replicas_scenario_no_consensus();
     return 0;
 }
