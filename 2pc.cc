@@ -1,11 +1,22 @@
 ﻿#include <experimental/thread_pool>
+#include <boost/range/algorithm/for_each.hpp>
 #include <iostream>
 #include <cassert>
 #include <type_traits>
 #include <stdexcept>
-#include <boost/range/algorithm/for_each.hpp>
+#include <mutex>
+#include <queue>
+#include <condition_variable>
 
-// TODO: without mutable and move it's ill-formed with wall of text :(
+/*
+ * Even with minimal_then_test helgrind complains a lot - implementation bug?
+ * Without mutable and move it's ill-formed with wall of text :(
+ * make_ready_future() is broken - implementation bug?
+   Dummy make_ready_future through thread pool was used.
+ * std_thread_safe_queue is not CopyConstructible nor MoveConstructible because of std:conditional_variable
+   explicit '= delete' improves diagnostics a lot (gcc)
+ * to warkaround above std::array was used
+*/
 
 namespace execution = std::experimental::execution;
 using std::experimental::static_thread_pool;
@@ -28,7 +39,7 @@ template<class FuturesContainer>
 requires requires (FuturesContainer c) {
     std::begin(c);
     std::end(c);
-    is_future<decltype(*std::begin(c))>::value;
+    Future<decltype(*std::begin(c))>;
 }
 inline auto
 when_all(FuturesContainer &&container) {
@@ -47,7 +58,7 @@ when_all(FuturesContainer &&container) {
 
 template<class T>
 [[nodiscard]]
-inline auto make_ready_future(T &&value) {
+inline auto make_ready_future__broken(T &&value) {
     promise<T> p;
     p.set_value(value);
     return p.get_future();
@@ -56,6 +67,16 @@ inline auto make_ready_future(T &&value) {
 enum class State {
     INITIAL, PROPOSE, VOTE, COMMIT_OR_ABORT
 };
+
+static_thread_pool pool(2);
+
+template<class T>
+[[nodiscard]]
+inline auto make_ready_future(T &&value) {
+    return execution::require(pool.executor(), execution::twoway).twoway_execute([value]{
+        return value;
+    });
+}
 
 class Node {
 public:
@@ -69,6 +90,7 @@ protected:
 class Replica final : public Node {
 public:
     Replica(bool should_commit_) noexcept : should_commit(should_commit_) {}
+    Replica(const Replica& replica) = delete;
 
     void run() override {
         assert(state == State::INITIAL);
@@ -92,21 +114,57 @@ public:
     }
 
     future<int> read() {
-        return make_ready_future<>(42);
+        auto value = *channel.front_and_pop();
+        return make_ready_future(value);
     }
 
-    future<int> write(int) {
-       return make_ready_future<>(24);
+    future<int> write(int value) {
+        channel.push(value);
+        return make_ready_future(value);
     }
 
 private:
     const bool should_commit;
+
+    template<class T>
+    class std_thread_safe_queue
+    {
+    public:
+        std_thread_safe_queue() = default;
+        std_thread_safe_queue(const std_thread_safe_queue&) = delete;
+        std_thread_safe_queue& operator=(std_thread_safe_queue&) = delete;
+
+        void push(T new_value)
+        {
+            std::lock_guard lock(mutex_);
+            queue_.push(std::move(new_value));
+            cv_.notify_one();
+        }
+
+        std::shared_ptr<T> front_and_pop()
+        {
+            std::unique_lock lock(mutex_);
+            cv_.wait(lock, [this]{ return !queue_.empty(); });
+            auto result = std::make_shared<T>(std::move(queue_.front()));
+            queue_.pop();
+            return result;
+        }
+
+        bool empty() const {
+            std::lock_guard<std::mutex> lock(mutex_);
+            return queue_.empty();
+        }
+    private:
+        mutable std::mutex mutex_;
+        std::queue<T> queue_;
+        std::condition_variable cv_;
+    };
+    std_thread_safe_queue<int> channel;
 };
 
 class Leader final : public Node {
 public:
-    Leader(const std::vector<Replica> &replicas_, int proposed_) : replicas(replicas_), proposed(proposed_) {}
-
+    Leader(std::array<Replica, 1> &replicas_, int proposed_) : replicas(replicas_), proposed(proposed_) {}
     void run() override {
         assert(state == State::INITIAL);
         state = State::PROPOSE;
@@ -146,7 +204,7 @@ public:
         result.get();
     }
 private:
-    std::vector<Replica> replicas;
+    std::array<Replica, 1> &replicas;
     const int proposed;
 };
 
@@ -165,22 +223,31 @@ static auto minimal_then_test() {
 }
 
 static auto one_leader_one_replica_scenario_with_consensus() {
-    auto replica = Replica(true);
-    auto leader = Leader({replica}, 123);
-    replica.run();
-    leader.run();
+    std::array replicas = {Replica(true)};
+    auto leader = Leader(replicas, 123);
+    execution::require(pool.executor(), execution::oneway).execute([&replicas]() mutable {
+        replicas[0].run();
+    });
+    execution::require(pool.executor(), execution::oneway).execute([&leader]{
+        leader.run();
+    });
+    pool.wait();
 }
 
-static auto one_leader_more_replicas_scenario_no_consensus() {
-    auto reps = std::vector<Replica>{Replica(true), Replica(false), Replica(true)};
-    auto leader = Leader(reps, 123);
-    boost::range::for_each(reps, [](auto &&rep){ rep.run(); });
-    leader.run();
-}
+//static auto one_leader_more_replicas_scenario_no_consensus() {
+//    auto reps = std::vector<Replica>{Replica(true), Replica(false), Replica(true)};
+//    auto leader = Leader(reps, 123);
+//    execution::require(pool.executor(), execution::oneway).oneway_execute([replica = std::move(replica)]{
+//        boost::range::for_each(reps, [](auto &&rep){ rep.run(); });
+//    });
+//    execution::require(pool.executor(), execution::oneway).oneway_execute([leader = std::move(leader)]{
+//        leader.run();
+//    });
+//}
 
 int main() {
     minimal_then_test();
     one_leader_one_replica_scenario_with_consensus();
-    one_leader_more_replicas_scenario_no_consensus();
+    //one_leader_more_replicas_scenario_no_consensus();
     return 0;
 }
