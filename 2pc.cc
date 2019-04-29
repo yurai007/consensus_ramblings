@@ -31,6 +31,39 @@ struct is_future : std::true_type {};
 //template <typename T>
 //struct is_future<future<T>> : std::true_type {};
 
+#if 0
+/*
+ * First one is broken - from some reason setting before getting cause Asan complains
+ * Second one is not correct - returned future is not ready
+*/
+template<class T>
+[[nodiscard]]
+inline auto make_ready_future__broken(T &&value) {
+    promise<T> p;
+    p.set_value(value);
+    return p.get_future();
+}
+
+template<class T>
+[[nodiscard]]
+inline auto make_ready_future__invalid(T &&value) {
+    return execution::require(pool.executor(), execution::never_blocking).twoway_execute([value]{
+        return value;
+    });
+}
+#endif
+
+static_thread_pool pool(2);
+
+template<class T>
+[[nodiscard]]
+inline auto make_ready_future(T &&value) {
+    promise<T> p;
+    auto f = p.get_future();
+    p.set_value(value);
+    return f;
+}
+
 #ifndef __clang__
 template <typename T>
 concept bool Future = is_future<T>::value;
@@ -44,39 +77,32 @@ requires requires (FuturesContainer c) {
 inline auto
 when_all(FuturesContainer &&container) {
     using Fut = std::decay_t<typename FuturesContainer::value_type>;
+    // fast path
     if (std::all_of(container.begin(), container.end(),
                     [](auto &&f) {
                         return f.is_ready(); })) {
         promise<FuturesContainer> p;
+        auto f = p.get_future();
         p.set_value(std::move(container));
-        return p.get_future();
+        return f;
     } else {
-        throw std::runtime_error("");
+        // slow path
+        future<FuturesContainer> f = execution::require(pool.executor(), execution::twoway).twoway_execute([container = std::move(container)]() mutable {
+            FuturesContainer c;
+            for (auto &&f : container) {
+                auto item = f.get();
+                c.emplace_back(std::move(make_ready_future(std::move(item))));
+           }
+            return std::move(c);
+        });
+        return f;
     }
 }
 #endif
 
-template<class T>
-[[nodiscard]]
-inline auto make_ready_future__broken(T &&value) {
-    promise<T> p;
-    p.set_value(value);
-    return p.get_future();
-}
-
 enum class State {
     INITIAL, PROPOSE, VOTE, COMMIT_OR_ABORT
 };
-
-static_thread_pool pool(2);
-
-template<class T>
-[[nodiscard]]
-inline auto make_ready_future(T &&value) {
-    return execution::require(pool.executor(), execution::twoway).twoway_execute([value]{
-        return value;
-    });
-}
 
 class Node {
 public:
@@ -106,7 +132,7 @@ public:
                     } else {
                         std::cout << "No consensus\n";
                     }
-                    return std::move(proposed_value);
+                    return make_ready_future(0);
                 });
             });
         });
@@ -115,12 +141,14 @@ public:
 
     future<int> read() {
         auto value = *channel.front_and_pop();
-        return make_ready_future(value);
+        std::cout << "read " << value << "\n";
+        return make_ready_future(std::move(value));
     }
 
     future<int> write(int value) {
+        std::cout << "write " << value << "\n";
         channel.push(value);
-        return make_ready_future(value);
+        return make_ready_future(std::move(value));
     }
 
 private:
@@ -165,6 +193,7 @@ private:
 class Leader final : public Node {
 public:
     Leader(std::array<Replica, 1> &replicas_, int proposed_) : replicas(replicas_), proposed(proposed_) {}
+
     void run() override {
         assert(state == State::INITIAL);
         state = State::PROPOSE;
@@ -208,18 +237,67 @@ private:
     const int proposed;
 };
 
-static auto minimal_then_test() {
-    static_thread_pool pool(1);
-    auto f = execution::require(pool.executor(), execution::twoway).twoway_execute([](){
-        return 42;
-    }).then([](auto maybe_value){
-        auto value = maybe_value.get();
-        return ++value;
-    }).then([](auto maybe_value){
-        auto value = maybe_value.get();
-        return ++value;
-    });
-    std::cout << f.get() << "\n";
+static auto returns_test() {
+    future<int> f;
+    return f;
+}
+
+static auto basic_tests() {
+    {
+        auto f = returns_test();
+        std::vector<future<int>> channels(6); // = {std::move(f)};
+
+#if 0   // why the hell CC is used here and everything is ill-formed ?
+        std::vector<future<int>> channels2 = {std::move(f)};
+        channels2.push_back(f);
+        channels2.emplace_back(f);
+#endif
+        // here everything is OK
+        channels[0] = std::move(f);
+        channels.push_back(std::move(f));
+        channels.emplace_back(std::move(f));
+    }
+    {
+        auto f = make_ready_future(321);
+        assert(f.is_ready());
+        assert(f.get() == 321);
+    }
+    #if 0 // here it 'works' in Asan but it's broken in when_all test
+    {
+        auto f = make_ready_future__broken(123);
+        assert(f.is_ready());
+        assert(f.get() == 123);
+    }
+    {
+        std::vector<future<int>> channels;
+        auto i = 123;
+        channels.emplace_back(std::move(make_ready_future__broken(std::move(i)))); // <--- move because it's NOT r-value!!
+    }
+    #endif
+    {
+        std::vector<future<int>> channels;
+        for (auto i = 0; i < 4; i++) {
+            channels.emplace_back(std::move(make_ready_future(std::move(i))));
+        }
+        auto result = when_all(std::move(channels)).then([](auto channels_) mutable {
+            return 123;
+        });
+        assert(result.get() == 123);
+    }
+    {
+        std::vector<future<int>> channels;
+        for (auto i = 0; i < 4; i++) {
+            auto f = execution::require(pool.executor(), execution::twoway).twoway_execute([i]{
+                return i;
+            });
+            channels.emplace_back(std::move(f));
+        }
+        auto result = when_all(std::move(channels)).then([](auto channels_) mutable {
+            return 123;
+        });
+        assert(result.get() == 123);
+    }
+    std::cout << "Tests: OK\n\n";
 }
 
 static auto one_leader_one_replica_scenario_with_consensus() {
@@ -234,20 +312,21 @@ static auto one_leader_one_replica_scenario_with_consensus() {
     pool.wait();
 }
 
-//static auto one_leader_more_replicas_scenario_no_consensus() {
-//    auto reps = std::vector<Replica>{Replica(true), Replica(false), Replica(true)};
-//    auto leader = Leader(reps, 123);
-//    execution::require(pool.executor(), execution::oneway).oneway_execute([replica = std::move(replica)]{
-//        boost::range::for_each(reps, [](auto &&rep){ rep.run(); });
-//    });
-//    execution::require(pool.executor(), execution::oneway).oneway_execute([leader = std::move(leader)]{
-//        leader.run();
-//    });
-//}
+#if 0
+static auto one_leader_more_replicas_scenario_no_consensus() {
+    auto reps = std::vector<Replica>{Replica(true), Replica(false), Replica(true)};
+    auto leader = Leader(reps, 123);
+    execution::require(pool.executor(), execution::oneway).oneway_execute([replica = std::move(replica)]{
+        boost::range::for_each(reps, [](auto &&rep){ rep.run(); });
+    });
+    execution::require(pool.executor(), execution::oneway).oneway_execute([leader = std::move(leader)]{
+        leader.run();
+    });
+}
+#endif
 
 int main() {
-    minimal_then_test();
+    basic_tests();
     one_leader_one_replica_scenario_with_consensus();
-    //one_leader_more_replicas_scenario_no_consensus();
     return 0;
 }
