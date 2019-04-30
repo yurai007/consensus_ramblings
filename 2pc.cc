@@ -7,6 +7,7 @@
 #include <mutex>
 #include <queue>
 #include <condition_variable>
+#include <syscall.h>
 
 /*
  * Even with minimal_then_test helgrind complains a lot - implementation bug?
@@ -54,6 +55,7 @@ inline auto make_ready_future__invalid(T &&value) {
 #endif
 
 static_thread_pool pool(2);
+constexpr auto debug = true;
 
 template<class T>
 [[nodiscard]]
@@ -67,13 +69,16 @@ inline auto make_ready_future(T &&value) {
 #ifndef __clang__
 template <typename T>
 concept bool Future = is_future<T>::value;
+#endif
 
 template<class FuturesContainer>
+#ifndef __clang__
 requires requires (FuturesContainer c) {
     std::begin(c);
     std::end(c);
     Future<decltype(*std::begin(c))>;
 }
+#endif
 inline auto
 when_all(FuturesContainer &&container) {
     using Fut = std::decay_t<typename FuturesContainer::value_type>;
@@ -98,7 +103,6 @@ when_all(FuturesContainer &&container) {
         return f;
     }
 }
-#endif
 
 enum class State {
     INITIAL, PROPOSE, VOTE, COMMIT_OR_ABORT
@@ -141,12 +145,16 @@ public:
 
     future<int> read() {
         auto value = *channel.front_and_pop();
-        std::cout << "read " << value << "\n";
+        if constexpr (debug) {
+            std::cout << "TID = " << syscall(SYS_gettid) << "    | read " << value << "\n";
+        }
         return make_ready_future(std::move(value));
     }
 
     future<int> write(int value) {
-        std::cout << "write " << value << "\n";
+        if constexpr (debug) {
+            std::cout << "TID = " << syscall(SYS_gettid) << "    | write " << value << "\n";
+        }
         channel.push(value);
         return make_ready_future(std::move(value));
     }
@@ -190,24 +198,21 @@ private:
     std_thread_safe_queue<int> channel;
 };
 
+template<unsigned N>
 class Leader final : public Node {
 public:
-    Leader(std::array<Replica, 1> &replicas_, int proposed_) : replicas(replicas_), proposed(proposed_) {}
+    Leader(std::array<Replica, N> &replicas_, int proposed_) : replicas(replicas_), proposed(proposed_) {}
 
     void run() override {
         assert(state == State::INITIAL);
         state = State::PROPOSE;
         std::vector<future<int>> channels;
-        for (auto &&replica : replicas) {
-            channels.emplace_back(replica.write(proposed));
-        }
+        boost::range::for_each(replicas, [&](auto &&rep){ channels.emplace_back(rep.write(proposed));});
         auto result = when_all(std::move(channels)).then([this](auto channels_) mutable {
             auto channels = channels_.get();
             channels.clear();
             state = State::VOTE;
-            for (auto &&replica : replicas) {
-                channels.emplace_back(replica.read());
-            }
+            boost::range::for_each(replicas, [&](auto &&rep){ channels.emplace_back(rep.read());});
             return when_all(std::move(channels)).then([this](auto channels_) mutable {
                 auto channels = channels_.get();
                 channels.clear();
@@ -215,9 +220,7 @@ public:
                 auto maybe_commit = std::all_of(channels.begin(), channels.end(), [](auto &&f){
                     return static_cast<bool>(f.get());
                 });
-                for (auto &&replica : replicas) {
-                    channels.emplace_back(replica.write(maybe_commit));
-                }
+                boost::range::for_each(replicas, [&](auto &&rep){ channels.emplace_back(rep.write(maybe_commit));});
                 return when_all(std::move(channels)).then([this, maybe_commit](auto channels) mutable noexcept {
                     if (maybe_commit) {
                         register_ = proposed;
@@ -233,7 +236,7 @@ public:
         result.get();
     }
 private:
-    std::array<Replica, 1> &replicas;
+    std::array<Replica, N> &replicas;
     const int proposed;
 };
 
@@ -302,8 +305,8 @@ static auto basic_tests() {
 
 static auto one_leader_one_replica_scenario_with_consensus() {
     std::array replicas = {Replica(true)};
-    auto leader = Leader(replicas, 123);
-    execution::require(pool.executor(), execution::oneway).execute([&replicas]() mutable {
+    auto leader = Leader<replicas.size()>(replicas, 123);
+    execution::require(pool.executor(), execution::oneway).execute([&replicas](){
         replicas[0].run();
     });
     execution::require(pool.executor(), execution::oneway).execute([&leader]{
@@ -312,21 +315,21 @@ static auto one_leader_one_replica_scenario_with_consensus() {
     pool.wait();
 }
 
-#if 0
 static auto one_leader_more_replicas_scenario_no_consensus() {
-    auto reps = std::vector<Replica>{Replica(true), Replica(false), Replica(true)};
-    auto leader = Leader(reps, 123);
-    execution::require(pool.executor(), execution::oneway).oneway_execute([replica = std::move(replica)]{
-        boost::range::for_each(reps, [](auto &&rep){ rep.run(); });
+    std::array replicas = {Replica(true), Replica(false), Replica(true)};
+    auto leader = Leader<replicas.size()>(replicas, 123);
+    execution::require(pool.executor(), execution::oneway).execute([&replicas]{
+        boost::range::for_each(replicas, [](auto &&rep){ rep.run(); });
     });
-    execution::require(pool.executor(), execution::oneway).oneway_execute([leader = std::move(leader)]{
+    execution::require(pool.executor(), execution::oneway).execute([&leader]{
         leader.run();
     });
+    pool.wait();
 }
-#endif
 
 int main() {
     basic_tests();
-    one_leader_one_replica_scenario_with_consensus();
+    //one_leader_one_replica_scenario_with_consensus();
+    one_leader_more_replicas_scenario_no_consensus();
     return 0;
 }
