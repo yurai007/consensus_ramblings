@@ -1,5 +1,7 @@
 ﻿#include <experimental/thread_pool>
 #include <boost/range/algorithm/for_each.hpp>
+#include <boost/range/adaptor/transformed.hpp>
+#include <boost/range/iterator_range.hpp>
 #include <iostream>
 #include <cassert>
 #include <type_traits>
@@ -12,11 +14,15 @@
 /*
  * Even with minimal_then_test helgrind complains a lot - implementation bug?
  * Without mutable and move it's ill-formed with wall of text :(
- * make_ready_future() is broken - implementation bug?
-   Dummy make_ready_future through thread pool was used.
+ * make_ready_future__broken/make_ready_future__invalid are not ok
  * std_thread_safe_queue is not CopyConstructible nor MoveConstructible because of std:conditional_variable
    explicit '= delete' improves diagnostics a lot (gcc)
- * to warkaround above std::array was used
+ * to warkaround above std::array with templated Leader was used
+ * when_all implementation is far from beeing perfect:
+   - takes container by r-value - it's ok from lifetime handling POV (caller must move collection),
+     and no hidden problems with interator invalidations etc.
+   - takes container/range by r-value - it's not ok when caller'd like to modify the range or when_all only part of range.
+     It's still not 100% safe, if range keeps pointers to other objects then lifetime issues still can happen
 */
 
 namespace execution = std::experimental::execution;
@@ -126,7 +132,7 @@ public:
         assert(state == State::INITIAL);
         auto result = read().then([this](auto proposed_value){
             state = State::PROPOSE;
-            return write(static_cast<int>(should_commit)).then([this, proposed_value = std::move(proposed_value)](auto _) mutable {
+            return write(static_cast<int>(should_commit)).then([this, proposed_value = std::move(proposed_value)](auto) mutable {
                 state = State::VOTE;
                 return read().then([this, proposed_value = std::move(proposed_value)](auto commit_reply) mutable {
                     state = State::COMMIT_OR_ABORT;
@@ -280,9 +286,9 @@ static auto basic_tests() {
     {
         std::vector<future<int>> channels;
         for (auto i = 0; i < 4; i++) {
-            channels.emplace_back(std::move(make_ready_future(std::move(i))));
+            channels.emplace_back(make_ready_future(std::move(i)));
         }
-        auto result = when_all(std::move(channels)).then([](auto channels_) mutable {
+        auto result = when_all(std::move(channels)).then([](auto) mutable noexcept {
             return 123;
         });
         assert(result.get() == 123);
@@ -295,10 +301,22 @@ static auto basic_tests() {
             });
             channels.emplace_back(std::move(f));
         }
-        auto result = when_all(std::move(channels)).then([](auto channels_) mutable {
+        auto result = when_all(std::move(channels)).then([](auto) mutable noexcept {
             return 123;
         });
         assert(result.get() == 123);
+    }
+    {
+        using namespace boost::adaptors;
+        auto integers = {0, 1, 2, 3};
+        // extra copy from range to collection needed
+        auto result = when_all(boost::copy_range<std::vector<future<int>>>(
+                                   integers | transformed([] (auto i) { return make_ready_future(std::move(i)); })
+                               ));
+        auto expected = 0;
+        for (auto &&i : result.get()) {
+            assert(i.get() == expected++);
+        }
     }
     std::cout << "Tests: OK\n\n";
 }
