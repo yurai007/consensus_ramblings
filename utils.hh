@@ -27,6 +27,7 @@ inline auto make_ready_future(T &&value) {
     return f;
 }
 
+// TO DO: clang (trunk) has experimental Xclang -fconcepts-ts already
 #ifndef __clang__
 template <typename T>
 concept bool Future = is_future<T>::value;
