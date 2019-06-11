@@ -5,7 +5,7 @@ import kotlin.system.measureTimeMillis
 // ref: https://raft.github.io/raft.pdf
 
 enum class State {
-    INITIAL
+    INITIAL, DONE
 }
 
 interface Message
@@ -29,34 +29,51 @@ class Follower() : Node() {
     override suspend fun run() {
         assert(state == State.INITIAL)
         currentTerm++
-        val heartbeat = receiveHeartbeat()
-        val appendEntries = receiveAppendEntriesReq()
-        // [1]
-        if (appendEntries.term < currentTerm) {
-            sendAppendEntriesResp(AppendEntriesResp(currentTerm, false))
-        }
-        val index = appendEntries.prevIndex
-        if (index < log.size) {
-            // [2]
-            if (log.get(index).term != appendEntries.prevTerm) {
-                sendAppendEntriesResp(AppendEntriesResp(currentTerm, false))
+
+        while (!done()) {
+            val heartbeat = receiveHeartbeat()
+            val appendEntries = receiveAppendEntriesReq()
+            var apply = true
+            // [1]
+            if (appendEntries.term < currentTerm) {
+                apply = false
+                sendAppendEntriesResp(AppendEntriesResp(currentTerm, apply))
             }
-        }
-        if (index + 1 < log.size) {
-            // [3]
-            if (log.get(index + 1).term != appendEntries.term) {
-                // TODO: delete the existing entry and all that follow it
+            val prevIndex = appendEntries.prevIndex
+            val prevTerm = appendEntries.prevTerm
+            if (prevIndex < log.size) {
+                // [2]
+                if (log.get(prevIndex).term != prevTerm) {
+                    apply = false
+                    sendAppendEntriesResp(AppendEntriesResp(currentTerm, apply))
+                }
             }
-        }
-        val (id, value) = appendEntries.entry
-        if (false) {
-            commitIndex++
-            logState.set(id, value)
-            println("Follower: $id := $value")
-        } else {
-            println("No consensus for $id")
-        }
-        state = State.INITIAL
+            if (prevIndex + 1 < log.size) {
+                // [3]
+                if (log.get(prevIndex + 1).term != appendEntries.term) {
+                    for (i in prevIndex + 1..log.size-1) {
+                        val ((key, value), _) = log.get(i)
+                        logState.remove(key)
+                        log.removeAt(i)
+                    }
+                    apply = false
+                    sendAppendEntriesResp(AppendEntriesResp(currentTerm, apply))
+                }
+            }
+            val (id, value) = appendEntries.entry
+            if (apply) {
+                sendAppendEntriesResp(AppendEntriesResp(currentTerm, apply))
+                log.add(InternalLogEntry(appendEntries.entry, currentTerm))
+                logState.set(id, value)
+                println("Follower: $id := $value")
+                commitIndex++
+                lastApplied++
+            } else {
+                println("No consensus for $id")
+            }
+            }
+        state = State.DONE
+        println("Follower: done")
     }
 
     suspend fun sendHeartbeat() = channelToLeader.send(HeartBeat())
@@ -65,6 +82,8 @@ class Follower() : Node() {
     suspend fun receiveAppendEntriesReq() : AppendEntriesReq = channelToLeader.receive() as AppendEntriesReq
     suspend fun receiveAppendEntriesResp() : AppendEntriesResp = channelToLeader.receive() as AppendEntriesResp
     suspend fun receiveHeartbeat() : Message = channelToLeader.receive()
+    fun done() : Boolean = channelToLeader.isClosedForReceive
+    fun close() : Boolean = channelToLeader.close()
 
     val channelToLeader = Channel<Message>()
 }
@@ -74,20 +93,22 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
         assert(state == State.INITIAL)
         currentTerm++
         followers.forEach {it.sendHeartbeat()}
+        var prevIndex = 0
+        var prevTerm = 0
         entriesToReplicate.forEach { (id, value) ->
                 val entry = Pair<Char, Int>(id, value)
-                var prevIndex = 0
-                var prevTerm = 0
                 if (!log.isEmpty()) {
                     prevIndex = log.size - 1
                     val lastEntry = log.get(prevIndex)
                     prevTerm = lastEntry.term
                 }
+                lastApplied++
                 log.add(InternalLogEntry(entry, currentTerm))
                 followers.forEach {it.sendAppendEntriesReq(AppendEntriesReq(entry, currentTerm, prevIndex, prevTerm, commitIndex))}
                 val responses = mutableListOf<AppendEntriesResp>()
                 followers.forEach {responses.add(it.receiveAppendEntriesResp())}
-                if (false) {
+                val expected = AppendEntriesResp(currentTerm, true)
+                if (responses.all {it == expected}) {
                     commitIndex++
                     logState.set(id, value)
                     println("Leader: $id := $value")
@@ -95,7 +116,9 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
                     println("No consensus for $id")
                 }
         }
-        state = State.INITIAL
+        followers.forEach { it.close() }
+        state = State.DONE
+        println("Leader: done")
     }
 
     val followers = followers
