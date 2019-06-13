@@ -24,14 +24,14 @@ abstract class Node {
     var lastApplied = 0
 }
 
-class Follower() : Node() {
+class Follower : Node() {
 
     override suspend fun run() {
         assert(state == State.INITIAL)
         currentTerm++
 
         while (!done()) {
-            val heartbeat = receiveHeartbeat()
+            receiveHeartbeat()
             val appendEntries = receiveAppendEntriesReq()
             var apply = true
             // [1]
@@ -43,16 +43,17 @@ class Follower() : Node() {
             val prevTerm = appendEntries.prevTerm
             if (prevIndex < log.size) {
                 // [2]
-                if (log.get(prevIndex).term != prevTerm) {
+                if (log[prevIndex].term != prevTerm) {
                     apply = false
                     sendAppendEntriesResp(AppendEntriesResp(currentTerm, apply))
                 }
             }
             if (prevIndex + 1 < log.size) {
                 // [3]
-                if (log.get(prevIndex + 1).term != appendEntries.term) {
+                if (log[prevIndex + 1].term != appendEntries.term) {
                     for (i in prevIndex + 1..log.size-1) {
-                        val ((key, value), _) = log.get(i)
+                        val (keyValue, _) = log[i]
+                        val (key, _) = keyValue
                         logState.remove(key)
                         log.removeAt(i)
                     }
@@ -64,28 +65,28 @@ class Follower() : Node() {
             if (apply) {
                 sendAppendEntriesResp(AppendEntriesResp(currentTerm, apply))
                 log.add(InternalLogEntry(appendEntries.entry, currentTerm))
-                logState.set(id, value)
+                logState[id] = value
                 println("Follower: $id := $value")
                 commitIndex++
                 lastApplied++
             } else {
                 println("No consensus for $id")
             }
-            }
+        }
         state = State.DONE
         println("Follower: done")
     }
 
     suspend fun sendHeartbeat() = channelToLeader.send(HeartBeat())
     suspend fun sendAppendEntriesReq(entriesReq : AppendEntriesReq) = channelToLeader.send(entriesReq)
-    suspend fun sendAppendEntriesResp(entriesResp : AppendEntriesResp) = channelToLeader.send(entriesResp)
-    suspend fun receiveAppendEntriesReq() : AppendEntriesReq = channelToLeader.receive() as AppendEntriesReq
+    private suspend fun sendAppendEntriesResp(entriesResp : AppendEntriesResp) = channelToLeader.send(entriesResp)
+    private suspend fun receiveAppendEntriesReq() : AppendEntriesReq = channelToLeader.receive() as AppendEntriesReq
     suspend fun receiveAppendEntriesResp() : AppendEntriesResp = channelToLeader.receive() as AppendEntriesResp
-    suspend fun receiveHeartbeat() : Message = channelToLeader.receive()
-    fun done() : Boolean = channelToLeader.isClosedForReceive
+    private suspend fun receiveHeartbeat() : Message = channelToLeader.receive()
+    private fun done() : Boolean = channelToLeader.isClosedForReceive
     fun close() : Boolean = channelToLeader.close()
 
-    val channelToLeader = Channel<Message>()
+    private val channelToLeader = Channel<Message>()
 }
 
 class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>) : Node() {
@@ -96,64 +97,88 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
         var prevIndex = 0
         var prevTerm = 0
         entriesToReplicate.forEach { (id, value) ->
-                val entry = Pair<Char, Int>(id, value)
-                if (!log.isEmpty()) {
-                    prevIndex = log.size - 1
-                    val lastEntry = log.get(prevIndex)
-                    prevTerm = lastEntry.term
-                }
-                lastApplied++
-                log.add(InternalLogEntry(entry, currentTerm))
-                followers.forEach {it.sendAppendEntriesReq(AppendEntriesReq(entry, currentTerm, prevIndex, prevTerm, commitIndex))}
-                val responses = mutableListOf<AppendEntriesResp>()
-                followers.forEach {responses.add(it.receiveAppendEntriesResp())}
-                val expected = AppendEntriesResp(currentTerm, true)
-                if (responses.all {it == expected}) {
-                    commitIndex++
-                    logState.set(id, value)
-                    println("Leader: $id := $value")
-                } else {
-                    println("No consensus for $id")
-                }
+            val entry = Pair(id, value)
+            if (!log.isEmpty()) {
+                prevIndex = log.size - 1
+                val lastEntry = log[prevIndex]
+                prevTerm = lastEntry.term
+            }
+            lastApplied++
+            log.add(InternalLogEntry(entry, currentTerm))
+            followers.forEach {it.sendAppendEntriesReq(AppendEntriesReq(entry, currentTerm, prevIndex, prevTerm, commitIndex))}
+            val responses = mutableListOf<AppendEntriesResp>()
+            followers.forEach {responses.add(it.receiveAppendEntriesResp())}
+            val expected = AppendEntriesResp(currentTerm, true)
+            if (responses.all {it == expected}) {
+                commitIndex++
+                logState[id] = value
+                println("Leader: $id := $value")
+            } else {
+                println("No consensus for $id")
+            }
         }
         followers.forEach { it.close() }
         state = State.DONE
         println("Leader: done")
     }
 
-    val followers = followers
-    val nextIndex = HashMap<Follower, Int>()
-    val matchIndex = HashMap<Follower, Int>()
-    val entriesToReplicate = entriesToReplicate
+    private val followers = followers
+    private val nextIndex = HashMap<Follower, Int>()
+    private val matchIndex = HashMap<Follower, Int>()
+    private val entriesToReplicate = entriesToReplicate
 }
 
-fun oneLeaderOneFollowerScenarioWithConsensus() = runBlocking<Unit> {
+fun oneLeaderOneFollowerScenarioWithConsensus() = runBlocking {
     val followers = listOf(Follower())
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
     val leader = Leader(followers, entriesToReplicate)
-    launch { leader.run() }
-    followers.forEach { launch { it.run() } }
+        launch {
+            try {
+                leader.run()
+            } catch (e : Exception) {}
+        }
+    followers.forEach { launch {
+        try {
+            it.run()
+        } catch (e : Exception) {}
+    } }
 }
 
-fun oneLeaderOneFollowerMoreEntriesScenarioWithConsensus() = runBlocking<Unit> {
+fun oneLeaderOneFollowerMoreEntriesScenarioWithConsensus() = runBlocking {
     val followers = listOf(Follower())
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2, 'x' to 3, 'z' to 2, 'y' to 1, 'y' to 3)
     val leader = Leader(followers, entriesToReplicate)
-    launch { leader.run() }
-    followers.forEach { launch { it.run() } }
+    launch {
+        try {
+            leader.run()
+        } catch (e : Exception) {}
+    }
+    followers.forEach { launch {
+        try {
+            it.run()
+        } catch (e : Exception) {}
+    } }
 }
 
-fun oneLeaderManyFollowersScenarioWithConsensus() = runBlocking<Unit> {
+fun oneLeaderManyFollowersScenarioWithConsensus() = runBlocking {
     val followers = listOf(Follower(), Follower(), Follower(), Follower(), Follower(), Follower(), Follower(),
-                 Follower(), Follower(), Follower(), Follower(), Follower(), Follower())
+        Follower(), Follower(), Follower(), Follower(), Follower(), Follower())
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
     val leader = Leader(followers, entriesToReplicate)
-    launch { leader.run() }
-    followers.forEach { launch { it.run() } }
+    launch {
+        try {
+            leader.run()
+        } catch (e : Exception) {}
+    }
+    followers.forEach { launch {
+        try {
+            it.run()
+        } catch (e : Exception) {}
+    } }
 }
 
-fun main(args: Array<String>) {
+fun main() {
     oneLeaderOneFollowerScenarioWithConsensus()
-    oneLeaderOneFollowerMoreEntriesScenarioWithConsensus()
-    oneLeaderManyFollowersScenarioWithConsensus()
+    //oneLeaderOneFollowerMoreEntriesScenarioWithConsensus()
+    //oneLeaderManyFollowersScenarioWithConsensus()
 }
