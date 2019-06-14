@@ -93,10 +93,10 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
     override suspend fun run() {
         assert(state == State.INITIAL)
         currentTerm++
-        followers.forEach {it.sendHeartbeat()}
         var prevIndex = 0
         var prevTerm = 0
         entriesToReplicate.forEach { (id, value) ->
+            followers.forEach {it.sendHeartbeat()}
             val entry = Pair(id, value)
             if (!log.isEmpty()) {
                 prevIndex = log.size - 1
@@ -132,11 +132,11 @@ fun oneLeaderOneFollowerScenarioWithConsensus() = runBlocking {
     val followers = listOf(Follower())
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
     val leader = Leader(followers, entriesToReplicate)
-        launch {
-            try {
-                leader.run()
-            } catch (e : Exception) {}
-        }
+    launch {
+        try {
+            leader.run()
+        } catch (e : Exception) {}
+    }
     followers.forEach { launch {
         try {
             it.run()
