@@ -10,7 +10,7 @@ enum class State {
 }
 
 interface Message
-data class HeartBeat(val dummy : Boolean = true) : Message
+data class HeartBeat(val done : Boolean = false) : Message
 data class AppendEntriesReq(val entry : Pair<Char, Int>, val term : Int, val prevIndex : Int, val prevTerm : Int, val leaderCommit : Int) : Message
 data class AppendEntriesResp(val term : Int, val success : Boolean) : Message
 data class InternalLogEntry(val entry : Pair<Char, Int>, val term : Int)
@@ -39,8 +39,8 @@ open class Follower : Node() {
         currentTerm++
         commitIndex = max(log.size - 1, 0)
 
-        while (!done()) {
-            receiveHeartbeat()
+        while (!done(receiveHeartbeat())) {
+
             val appendEntries = receiveAppendEntriesReq()
             var apply = true
             // [1]
@@ -81,11 +81,6 @@ open class Follower : Node() {
         }
         state = State.DONE
         println("Follower $this: done")
-        trackLog()
-    }
-
-    fun resetChannel() {
-        channelToLeader = Channel()
     }
 
     private fun shrinkUntil(index : Int) {
@@ -97,16 +92,17 @@ open class Follower : Node() {
         }
     }
 
-    suspend fun sendHeartbeat() = channelToLeader.send(HeartBeat())
+    fun verifyLog(expectedLog : MutableList<InternalLogEntry> ) : Boolean = expectedLog == log
+
+    suspend fun sendHeartbeat(done : Boolean) = channelToLeader.send(HeartBeat(done))
     suspend fun sendAppendEntriesReq(entriesReq : AppendEntriesReq) = channelToLeader.send(entriesReq)
     private suspend fun sendAppendEntriesResp(entriesResp : AppendEntriesResp) = channelToLeader.send(entriesResp)
     private suspend fun receiveAppendEntriesReq() : AppendEntriesReq = channelToLeader.receive() as AppendEntriesReq
     suspend fun receiveAppendEntriesResp() : AppendEntriesResp = channelToLeader.receive() as AppendEntriesResp
-    private suspend fun receiveHeartbeat() : Message = channelToLeader.receive()
-    private fun done() : Boolean = channelToLeader.isClosedForReceive
-    fun close() : Boolean = channelToLeader.close()
+    private suspend fun receiveHeartbeat() : HeartBeat = channelToLeader.receive() as HeartBeat
+    private fun done(heartBeat : HeartBeat) : Boolean = heartBeat.done
 
-    private var channelToLeader = Channel<Message>()
+    private val channelToLeader = Channel<Message>()
 }
 
 class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>) : Node() {
@@ -116,7 +112,7 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
         currentTerm++
         println("Leader of term $currentTerm")
         entriesToReplicate.forEach { (id, value) ->
-            followers.forEach {it.sendHeartbeat()}
+            followers.forEach {it.sendHeartbeat(false)}
             val entry = Pair(id, value)
             lastApplied++
             log.add(InternalLogEntry(entry, currentTerm))
@@ -142,15 +138,13 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
             followers.forEach { nextIndex[it] = replicaNextIndex(it) + 1 }
             println("Leader: $id := $value")
         }
-        followers.forEach { it.close() }
+        followers.forEach {it.sendHeartbeat(true)}
         state = State.DONE
         println("Leader: done")
-        trackLog()
     }
 
     fun replicateEntries(entriesToReplicate_ : HashMap<Char, Int>) {
         entriesToReplicate = entriesToReplicate_
-        followers.forEach { it.resetChannel() }
     }
 
     private fun replicaNextIndex(replica : Follower) : Int = nextIndex[replica]!!
@@ -190,14 +184,19 @@ fun oneLeaderOneFollowerScenarioWithConsensus() = runBlocking {
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
     val leader = Leader(followers, entriesToReplicate)
     launchLeaderAndFollowers(leader, followers)
+    followers.forEach {assert(it.verifyLog(mutableListOf(InternalLogEntry('x' to 1, 1),
+        InternalLogEntry('y' to 2, 1) ))) }
     println()
 }
 
 fun oneLeaderOneFollowerMoreEntriesScenarioWithConsensus() = runBlocking {
     val followers = listOf(Follower())
-    val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2, 'x' to 3, 'z' to 2, 'y' to 1, 'y' to 3)
+    val entriesToReplicate = hashMapOf('1' to 1, '2' to 2, '3' to 3, '4' to 2, '5' to 1, '6' to 3)
     val leader = Leader(followers, entriesToReplicate)
     launchLeaderAndFollowers(leader, followers)
+    followers.forEach {assert(it.verifyLog(mutableListOf(InternalLogEntry('1' to 1, 1),
+        InternalLogEntry('2' to 2, 1), InternalLogEntry('3' to 3, 1), InternalLogEntry('4' to 2, 1),
+        InternalLogEntry('5' to 1, 1), InternalLogEntry('6' to 3, 1)))) }
     println()
 }
 
@@ -207,6 +206,8 @@ fun oneLeaderManyFollowersScenarioWithConsensus() = runBlocking {
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
     val leader = Leader(followers, entriesToReplicate)
     launchLeaderAndFollowers(leader, followers)
+    followers.forEach {assert(it.verifyLog(mutableListOf(InternalLogEntry('x' to 1, 1),
+        InternalLogEntry('y' to 2, 1) ))) }
     println()
 }
 
@@ -215,6 +216,8 @@ fun oneLeaderManyFollowersWithArtificialOneScenarioWithConsensus() = runBlocking
     val entriesToReplicate = hashMapOf('x' to 1, 'y' to 2)
     val leader = Leader(followers, entriesToReplicate)
     launchLeaderAndFollowers(leader, followers)
+    followers.forEach {assert(it.verifyLog(mutableListOf(InternalLogEntry('x' to 1, 1),
+        InternalLogEntry('y' to 2, 1) ))) }
     println()
 }
 
@@ -232,6 +235,8 @@ fun oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus() = runBlocking {
     leader.replicateEntries(entries2)
     println("Term 2 - replicate entries2")
     launchLeaderAndFollowers(leader, followers)
+    followers.forEach {assert(it.verifyLog(mutableListOf(InternalLogEntry('a' to 1, 1),
+        InternalLogEntry('b' to 2, 1), InternalLogEntry('d' to 4, 2), InternalLogEntry('c' to 3, 2) ))) }
     println()
 }
 
@@ -251,10 +256,13 @@ fun oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus2() = runBlocking 
     println("Term 2 - replicate entries2")
     launchLeaderAndFollowers(leader, followers)
 
-    artificialFollower.poison(1, mutableListOf(InternalLogEntry('x' to 42, 1)))
+    artificialFollower.poison(1, mutableListOf(InternalLogEntry('a' to 1, 1)))
     leader.replicateEntries(entries3)
     println("Term 3 - replicate entries3; follower log is going to be aligned")
     launchLeaderAndFollowers(leader, followers)
+    followers.forEach {assert(it.verifyLog(mutableListOf(InternalLogEntry('a' to 1, 1),
+        InternalLogEntry('b' to 2, 1), InternalLogEntry('d' to 4, 2), InternalLogEntry('c' to 3, 2),
+        InternalLogEntry('e' to 5, 3)))) }
     println()
 }
 
