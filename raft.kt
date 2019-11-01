@@ -38,17 +38,10 @@ open class Follower : Node() {
         state = State.INITIAL
         currentTerm++
         commitIndex = max(log.size - 1, 0)
-
         while (!done(receiveHeartbeat())) {
 
             val appendEntries = receiveAppendEntriesReq()
             var apply = true
-            // [1]
-            if (appendEntries.term < currentTerm) {
-                apply = false
-            } else if (appendEntries.term > currentTerm) {
-                currentTerm = appendEntries.term
-            }
             val prevIndex = appendEntries.prevIndex
             val prevTerm = appendEntries.prevTerm
             if (prevIndex >= 0) {
@@ -64,20 +57,22 @@ open class Follower : Node() {
                     // [3]
                     if (log[prevIndex + 1].term != appendEntries.term) {
                         // cleanup because of inconsistency, leave only log[0..prevIndex] prefix,
-                        // in next iteration in case of further inconsistency we should reach [2]
+                        // with assumption that prefix is valid we can append entry in this iteration
                         shrinkUntil(prevIndex)
-                        apply = false
                     }
                 }
             }
-            sendAppendEntriesResp(AppendEntriesResp(currentTerm, apply))
+            sendAppendEntriesResp(AppendEntriesResp(appendEntries.term, apply))
             val (id, value) = appendEntries.entry
             if (apply) {
-                log.add(InternalLogEntry(appendEntries.entry, currentTerm))
+                log.add(InternalLogEntry(appendEntries.entry, appendEntries.term))
                 logState[id] = value
                 println("Follower $this: $id := $value")
                 commitIndex++
                 lastApplied++
+                if (appendEntries.term > currentTerm) {
+                    currentTerm = appendEntries.term
+                }
             } else {
                 println("Follower $this: no consensus for $id")
                 trackLog()
@@ -124,23 +119,33 @@ class Leader(followers : List<Follower>, entriesToReplicate : HashMap<Char, Int>
 
             followers.forEach {
                 do {
-                    var mayBeCommited = true
+                    var followerIsDone = false
                     val prevIndex = min(replicaNextIndex(it) - 1, log.size - 1)
                     val prevTerm = if (prevIndex >= 0) log[prevIndex].term  else 0
-                    it.sendAppendEntriesReq(AppendEntriesReq(entry, currentTerm, prevIndex, prevTerm, commitIndex))
+                    val term = if (prevIndex + 1 >= 0 && prevIndex + 1 < log.size) log[prevIndex + 1].term  else currentTerm
+                    it.sendAppendEntriesReq(AppendEntriesReq(entry, term, prevIndex, prevTerm, commitIndex))
                     val response = it.receiveAppendEntriesResp()
-                    val expected = AppendEntriesResp(currentTerm, true)
+                    val expected = AppendEntriesResp(term, true)
                     if (response != expected) {
-                        mayBeCommited = false
+                        println("Leader: No consensus for $entry")
                         nextIndex[it] = replicaNextIndex(it) - 1
                         if (replicaNextIndex(it) >= 0) {
                             entry = log[replicaNextIndex(it)].entry
                         }
                         it.sendHeartbeat(false)
-                        println("Leader: No consensus for $id")
                         trackLog()
+                    } else if (term == currentTerm) {
+                        followerIsDone = true
+                    } else {
+                        nextIndex[it] = replicaNextIndex(it) + 1
+                        if (replicaNextIndex(it) < log.size) {
+                            entry = log[replicaNextIndex(it)].entry
+                        } else {
+                            entry = Pair(id, value)
+                        }
+                        it.sendHeartbeat(false)
                     }
-                } while (!mayBeCommited)
+                } while (!followerIsDone)
             }
             commitIndex++
             logState[id] = value
@@ -250,7 +255,7 @@ fun oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus() = runBlocking {
 }
 
 fun oneLeaderOneFollowerShouldCatchUpWithConsensus() = runBlocking {
-    println("oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus2")
+    println("oneLeaderOneFollowerShouldCatchUpWithConsensus")
     val entries1 = hashMapOf('a' to 1, 'b' to 2)
     val entries2 = hashMapOf('c' to 3, 'd' to 4)
     val entries3 = hashMapOf('e' to 5)
@@ -276,7 +281,7 @@ fun oneLeaderOneFollowerShouldCatchUpWithConsensus() = runBlocking {
 }
 
 fun oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus() = runBlocking {
-    println("oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus2")
+    println("oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus")
     val entries1 = hashMapOf('a' to 1)
     val entries2 = hashMapOf('c' to 3, 'd' to 4)
     val entries3 = hashMapOf('e' to 5)
@@ -306,6 +311,37 @@ fun oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus() = runBlo
     println()
 }
 
+fun oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus2() = runBlocking {
+    println("oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus2")
+    val entries1 = hashMapOf('a' to 1)
+    val entries2 = hashMapOf('c' to 3, 'd' to 4)
+    val entries3 = hashMapOf('e' to 5)
+    val artificialFollower = ArtificialFollower()
+    val followers = listOf(artificialFollower)
+
+    val leader = Leader(followers, entries1)
+    println("Term 1 - replicate entries1")
+    launchLeaderAndFollowers(leader, followers)
+
+    leader.replicateEntries(hashMapOf())
+    println("Term 2 & 3 - just bump Leader term")
+    launchLeaderAndFollowers(leader, followers)
+    leader.replicateEntries(hashMapOf())
+    launchLeaderAndFollowers(leader, followers)
+
+    leader.replicateEntries(entries2)
+    println("Term 4 - replicate entries2")
+    launchLeaderAndFollowers(leader, followers)
+
+    artificialFollower.poison(4, mutableListOf(InternalLogEntry('a' to 1, 1), InternalLogEntry('b' to 1, 1),
+        InternalLogEntry('x' to 2, 2), InternalLogEntry('z' to 2, 2), InternalLogEntry('p' to 3, 3), InternalLogEntry('q' to 3, 3),
+        InternalLogEntry('c' to 3, 4), InternalLogEntry('d' to 4, 4)))
+    leader.replicateEntries(entries3)
+    println("Term 5 - replicate entries3; follower log is going to be aligned")
+    launchLeaderAndFollowers(leader, followers)
+    println()
+}
+
 fun main() {
     oneLeaderOneFollowerScenarioWithConsensus()
     oneLeaderOneFollowerMoreEntriesScenarioWithConsensus()
@@ -314,4 +350,5 @@ fun main() {
     oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus()
     oneLeaderOneFollowerShouldCatchUpWithConsensus()
     oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus()
+    oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus2()
 }
