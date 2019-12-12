@@ -5,31 +5,6 @@
 #include <iostream>
 #include <future>
 
-/* Ref: https://luncliff.github.io/coroutine/articles/designing-the-channel
-   TO DO: hmm, even without iostream, still:
-   ERROR SUMMARY: 4 errors from 4 contexts (suppressed: 68 from 38) from helgrind,
-          but maybe because of static_thread_pool, check it later only with channel.
-
- channel = (writer_list(head, tail),
-              reader_list(head, tail),
-              mutex)
- * write(int x):
-   - writer(channel, &x) -> channel() ->
-        ptr = &x;
- * writer::await_ready()
- * co_await ch.write(msg) ->
-        writer::await_suspend() -> remember coroutine_handle (frame) + writer_list::push()
- * co_await (msg, end) = ch.read() ->
-        reader::await_ready() -> writer_list::pop(); + remember coroutine_handle (frame)
-        from popped writer
- * reader::await_resume -> resume coroutine_handle (frame)
-
- Notice that:
- Our list is allocation free, we store there pointers to externally owned local values.
-
- TO DO: check destructor scenario
-*/
-
 namespace stdx = std::experimental;
 
 template <typename R, typename... Args>
@@ -82,28 +57,20 @@ private:
     T* tail{};
 };
 
-struct bypass_lock final {
-    constexpr bool try_lock() noexcept {
-        return true;
-    }
-    constexpr void lock() noexcept {}
-    constexpr void unlock() noexcept {}
-};
-
-template <typename T, typename M = std::mutex>
+template <typename T>
 class channel;
-template <typename T, typename M>
+template <typename T>
 class reader;
-template <typename T, typename M>
+template <typename T>
 class writer;
 
-template <typename T, typename M>
+template <typename T>
 class [[nodiscard]] reader final {
 public:
     using value_type = T;
     using pointer = T*;
     using reference = T&;
-    using channel_type = channel<T, M>;
+    using channel_type = channel<T>;
 
 private:
     using reader_list = typename channel_type::reader_list;
@@ -146,7 +113,6 @@ public:
 public:
     bool await_ready() const  {
         std::cout << __PRETTY_FUNCTION__ << std::endl;
-        channel->mtx.lock();
         if (channel->writer_list::is_empty()) {
             return false;
         }
@@ -154,8 +120,6 @@ public:
         // exchange address & resumeable_handle
         std::swap(value_ptr, w->value_ptr);
         std::swap(frame, w->frame);
-
-        channel->mtx.unlock();
         return true;
     }
     void await_suspend(stdx::coroutine_handle<> coro) {
@@ -166,7 +130,6 @@ public:
         next = nullptr;         // clear to prevent confusing
 
         ch.reader_list::push(this);
-        ch.mtx.unlock();
     }
     std::tuple<value_type, bool> await_resume() {
         std::cout << __PRETTY_FUNCTION__ << std::endl;
@@ -187,13 +150,13 @@ public:
     }
 };
 
-template <typename T, typename M>
+template <typename T>
 class [[nodiscard]] writer final {
 public:
     using value_type = T;
     using pointer = T*;
     using reference = T&;
-    using channel_type = channel<T, M>;
+    using channel_type = channel<T>;
 
 private:
     using reader = typename channel_type::reader;
@@ -236,7 +199,6 @@ public:
 public:
     bool await_ready() const {
         std::cout << __PRETTY_FUNCTION__ << std::endl;
-        channel->mtx.lock();
         if (channel->reader_list::is_empty()) {
             return false;
         }
@@ -244,8 +206,6 @@ public:
         // exchange address & resumeable_handle
         std::swap(value_ptr, r->value_ptr);
         std::swap(frame, r->frame);
-
-        channel->mtx.unlock();
         return true;
     }
     void await_suspend(stdx::coroutine_handle<> coro) {
@@ -257,7 +217,6 @@ public:
         next = nullptr;         // clear to prevent confusing
 
         ch.writer_list::push(this);
-        ch.mtx.unlock();
     }
     bool await_resume() {
         std::cout << __PRETTY_FUNCTION__ << std::endl;
@@ -272,8 +231,8 @@ public:
     }
 };
 
-template <typename T, typename M>
-class channel final : list<reader<T, M>>, list<writer<T, M>> {
+template <typename T>
+class channel final : list<reader<T>>, list<writer<T>> {
     static_assert(std::is_reference<T>::value == false,
                   "reference type can't be channel's value_type.");
 
@@ -281,24 +240,21 @@ public:
     using value_type = T;
     using pointer = value_type*;
     using reference = value_type&;
-    using mutex_type = M;
 
 private:
-    using reader = reader<value_type, mutex_type>;
+    using reader = reader<value_type>;
     using reader_list = list<reader>;
-    using writer = writer<value_type, mutex_type>;
+    using writer = writer<value_type>;
     using writer_list = list<writer>;
 
     friend reader;
     friend writer;
-
-    mutex_type mtx;
 public:
     channel(const channel&) noexcept = delete;
     channel(channel&&) noexcept = delete;
     channel& operator=(const channel&) noexcept = delete;
     channel& operator=(channel&&) noexcept = delete;
-    channel() noexcept : reader_list{}, writer_list{}, mtx{} {}
+    channel() noexcept : reader_list{}, writer_list{} {}
 
     ~channel() noexcept(false)
     {
@@ -318,8 +274,6 @@ public:
         //
         auto repeat = 1; // author experienced 5'000+ for hazard usage
         while (repeat--) {
-            std::unique_lock lck{mtx};
-
             while (!writers.is_empty()) {
                 auto w = writers.pop();
                 auto coro = stdx::coroutine_handle<>::from_address(w->frame);

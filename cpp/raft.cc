@@ -118,7 +118,7 @@ public:
     bool verifyLog(const std::vector<InternalLogEntry>&) const { return true; }
     virtual ~Follower() noexcept(false) {}
 private:
-    channel<Message*, bypass_lock> channelToLeader;
+    channel<Message*> channelToLeader;
     std::unique_ptr<Message> msg;
     Message *msg_p = nullptr;
 
