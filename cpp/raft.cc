@@ -9,6 +9,37 @@
 #include <iostream>
 #include <future>
 #include <stdexcept>
+#include <compare>
+
+#ifndef __clang__
+
+namespace internal {
+
+template<class T>
+concept Awaiter = requires(T &t) {
+    {t.await_ready() } -> std::same_as<bool>;
+    {t.await_suspend(stdx::coroutine_handle<>{}) } -> std::same_as<void>;
+    {t.await_resume() } -> std::same_as<bool>;
+};
+
+template <template <class U> class Channel, class T, class Writer, class Reader>
+concept CoroutineChannelAux = requires (Channel<T>& c, T &t, Writer &w, Reader &r) {
+    {c.write(t)} noexcept -> std::same_as<Writer>;
+    {c.read()} noexcept -> std::same_as<Reader>;
+    Awaiter<Writer>;
+    Awaiter<Reader>;
+};
+}
+
+template< template <class U> class Channel, class T>
+concept CoroutineChannel = requires (Channel<T> &c) {
+    internal::CoroutineChannelAux<Channel, typename Channel<T>::value_type, typename Channel<T>::writer, typename Channel<T>::reader>;
+};
+
+// it's important for implementation to have fully preemptable coroutine channel
+// TODO: trunk gcc-10 should accept that.
+static_assert(CoroutineChannel<channel>);
+#endif
 
 enum class State { INITIAL, DONE };
 
@@ -33,8 +64,10 @@ struct AppendEntriesResp : Message {
         : term(_term), success(_success) {}
     int term;
     bool success;
-    bool operator!=(const AppendEntriesResp &other) const {
-        return term != other.term || success != other.success;
+    // a little bit more general but still cool
+    auto operator<=>(const AppendEntriesResp& rhs) const noexcept {
+        auto first = term <=> rhs.term;
+        return (first != 0)? first : success <=> rhs.success;
     }
 };
 
@@ -203,7 +236,7 @@ public:
                     auto response = *it.receiveAppendEntriesResp().get();
                     auto expected = AppendEntriesResp(term, true);
 
-                     if (response != expected) {
+                     if (response <=> expected != 0) {
                         std::cout << "Leader: No consensus for " << id << " " << value << std::endl;
                         nextIndex[&it] = replicaNextIndex(&it) - 1;
                         if (replicaNextIndex(&it) >= 0) {
