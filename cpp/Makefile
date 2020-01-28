@@ -12,8 +12,8 @@ tests: tests.cc
 
 raft: CXX := clang++
 raft: CXXFLAGS = -g -std=c++2a -fcoroutines-ts -Wno-c99-extensions -Wno-c++98-compat-pedantic -stdlib=libc++
-#raft: CXXFLAGS += -fsanitize=address -fsanitize-recover=address -fsanitize=undefined -fsanitize-address-use-after-scope -fsanitize=signed-integer-overflow -fsanitize=vptr
-# TO DO: with sanitizers bug in backend? fatal error: error in backend: Cannot represent a difference across section 
+raft: CXXFLAGS += -fsanitize=address -fsanitize-recover=address -fsanitize-address-use-after-scope -fsanitize=signed-integer-overflow -fsanitize=vptr
+# TO DO: with UBsan bug in backend? fatal error: error in backend: Cannot represent a difference across section 
 raft: raft.cc
 	$(CXX) $(CXXFLAGS) raft.cc -o raft $(LDFLAGS)
 

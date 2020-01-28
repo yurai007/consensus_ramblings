@@ -12,24 +12,22 @@
 
 class cooperative_scheduler final {
 public:
-    cooperative_scheduler(void (*f1) (void), void (*f2) (void)) noexcept {
+    template<class... Args>
+    cooperative_scheduler(Args&&... args) noexcept {
         just_me = this;
         std::cout << "pid: " << getpid() << std::endl;
-        // allocate the global signal/interrupt stack
-        signal_stack = malloc(stacksize);
+        signal_stack = std::malloc(stacksize);
         assert(signal_stack);
-
-        mkcontext(f2);
-        mkcontext(f1);
-        // initialize the signal handlers
+        make_contexts(std::forward<Args>(args)...);
         setup_signals();
         setup_timer();
         auto rc = std::atexit([]{
             // temporary workaround to silent memcheck
             // we need to be sure all fibers done their job
             std::cout << "cleanup" << std::endl;
-            for (auto &&context : just_me->contexts) {
-                free(context.uc_stack.ss_sp);
+            for (auto i = 0u; i < just_me->contexts.size(); i++) {
+                auto &context = just_me->contexts[i];
+                std::free(context.uc_stack.ss_sp);
             }
             free(just_me->signal_stack);
             just_me->~cooperative_scheduler();
@@ -41,6 +39,17 @@ public:
     cooperative_scheduler(const cooperative_scheduler&) = delete;
     cooperative_scheduler& operator=(const cooperative_scheduler&) = delete;
 private:
+    template<class Arg>
+    void make_contexts(void (*f) (Arg*), Arg &a) noexcept {
+        mkcontext(f, &a);
+    }
+
+    template<class Arg, class... Args>
+    void make_contexts(void (*f) (Arg*), Arg &a, Args&&... args) noexcept {
+        mkcontext(f, &a);
+        make_contexts(std::forward<Args>(args)...);
+    }
+
     static void round_rubin_scheduler() noexcept {
         assert(!just_me->contexts.empty());
         auto old_context = just_me->current_context;
@@ -56,13 +65,11 @@ private:
       contexts saving the previously executing thread and jumping to the
       scheduler.
     */
-    static void timer_interrupt(int, siginfo_t *, void *) noexcept {
+    static void timer_interrupt(int, siginfo_t*, void*) noexcept {
         // Create new scheduler context
         auto signal_context = &(just_me->signal_context);
         getcontext(signal_context);
-        signal_context->uc_stack.ss_sp = just_me->signal_stack;
-        signal_context->uc_stack.ss_size = stacksize;
-        signal_context->uc_stack.ss_flags = 0;
+        signal_context->uc_stack =  {just_me->signal_stack, 0, stacksize};
         sigemptyset(&(signal_context->uc_sigmask));
         makecontext(signal_context, round_rubin_scheduler, 1);
 
@@ -88,28 +95,24 @@ private:
        initialize the context from the current context, setup the new
        stack, signal mask, and tell it which function to call.
     */
-    void mkcontext(void (*function) (void)) noexcept {
+    template<class Arg>
+    void mkcontext(void (*function) (Arg*), Arg *a) noexcept {
         contexts.emplace_back();
-        auto *uc = &contexts.back();
+        auto uc = &contexts.back();
         getcontext(uc);
-
-        auto *stack = malloc(stacksize);
+        auto stack = std::malloc(stacksize);
         assert(stack);
-        // we need to initialize the ucontext structure, give it a stack flags, and a sigmask
-        uc->uc_stack.ss_sp = stack;
-        uc->uc_stack.ss_size = stacksize;
-        uc->uc_stack.ss_flags = 0;
+        uc->uc_stack = {stack, 0, stacksize};
         auto rc = sigemptyset(&uc->uc_sigmask);
         assert(rc >= 0);
-        makecontext(uc, function, 1);
+
+        makecontext(uc, reinterpret_cast<void (*)(void)>(function), 1, a);
         std::cout << "context is " << uc << std::endl;
     }
 
     static void setup_timer() noexcept {
-        itimerval it;
-        it.it_interval.tv_sec = 0;
-        it.it_interval.tv_usec = 100'000; // 100 ms
-        it.it_value = it.it_interval;
+        timeval tv = {0, 100'000}; // 100ms
+        itimerval it = {tv, tv};
         auto rc = setitimer(ITIMER_REAL, &it, nullptr);
         assert(rc == 0);
     }

@@ -279,14 +279,11 @@ private:
      }
 };
 
-// temporary workaround - currently fibers cannot take arguments
-Leader *_leader;
-std::vector<Follower> *_followers;
 std::promise<bool> done;
 std::future<bool> donef = done.get_future();
 
-static void leaderFiber() {
-    auto task = []() -> std::future<int> {
+static void leaderFiber(Leader *_leader) {
+    auto task = [_leader]() -> std::future<int> {
         try {
             _leader->run();
         } catch (const std::exception &e) { std::cout << "Leader: failed with: " << e.what() << std::endl; }
@@ -296,8 +293,8 @@ static void leaderFiber() {
     donef.get();
 }
 
-static void followersFiber() {
-    auto task = []() -> std::future<int> {
+static void followersFiber(std::vector<Follower> *_followers) {
+    auto task = [_followers]() -> std::future<int> {
             boost::for_each(*_followers, [](auto &&follower){
                 try {
                     follower.run();
@@ -310,9 +307,7 @@ static void followersFiber() {
 }
 
 static void launchLeaderAndFollowers(Leader &leader, std::vector<Follower> &followers) {
-    _leader = &leader;
-    _followers = &followers;
-    cooperative_scheduler{leaderFiber, followersFiber};
+    cooperative_scheduler{leaderFiber, leader, followersFiber, followers};
 }
 
 static void oneLeaderOneFollowerScenarioWithConsensus() {
