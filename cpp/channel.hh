@@ -1,14 +1,12 @@
 ﻿#pragma once
 
-#include <experimental/coroutine>
+#include <coroutine>
 #include <mutex>
 #include <iostream>
 #include <future>
 
-namespace stdx = std::experimental;
-
 template <typename R, typename... Args>
-struct stdx::coroutine_traits<std::future<R>, Args...> {
+struct std::coroutine_traits<std::future<R>, Args...> {
     // promise_type - part of coroutine state
     struct promise_type {
         std::promise<R> p;
@@ -86,12 +84,12 @@ protected:
     mutable void* frame; // Resumeable Handle
     union {
         reader* next = nullptr; // Next reader in channel
-        channel_type* channel;     // Channel to push this reader
+        channel_type* channel_;     // Channel to push this reader
     };
 
 private:
     explicit reader(channel_type& ch) noexcept
-        : value_ptr{}, frame{}, channel{std::addressof(ch)} {
+        : value_ptr{}, frame{}, channel_{std::addressof(ch)} {
     }
     reader(const reader&) noexcept = delete;
     reader& operator=(const reader&) noexcept = delete;
@@ -100,12 +98,12 @@ public:
     reader(reader&& rhs) noexcept {
         std::swap(value_ptr, rhs.value_ptr);
         std::swap(frame, rhs.frame);
-        std::swap(channel, rhs.channel);
+        std::swap(channel_, rhs.channel_);
     }
     reader& operator=(reader&& rhs) noexcept {
         std::swap(value_ptr, rhs.value_ptr);
         std::swap(frame, rhs.frame);
-        std::swap(channel, rhs.channel);
+        std::swap(channel_, rhs.channel_);
         return *this;
     }
     ~reader() noexcept = default;
@@ -113,19 +111,19 @@ public:
 public:
     bool await_ready() const  {
         std::cout << __PRETTY_FUNCTION__ << std::endl;
-        if (channel->writer_list::is_empty()) {
+        if (channel_->writer_list::is_empty()) {
             return false;
         }
-        auto w = channel->writer_list::pop();
+        auto w = channel_->writer_list::pop();
         // exchange address & resumeable_handle
         std::swap(value_ptr, w->value_ptr);
         std::swap(frame, w->frame);
         return true;
     }
-    void await_suspend(stdx::coroutine_handle<> coro) {
+    void await_suspend(std::coroutine_handle<> coro) {
         std::cout << __PRETTY_FUNCTION__ << std::endl;
         // notice that next & chan are sharing memory
-        auto& ch = *(this->channel);
+        auto& ch = *(this->channel_);
         frame = coro.address(); // remember handle before push/unlock
         next = nullptr;         // clear to prevent confusing
 
@@ -142,7 +140,7 @@ public:
         // can destroy the writer coroutine
         auto& value = std::get<0>(t);
         value = std::move(*value_ptr);
-        if (auto coro = stdx::coroutine_handle<>::from_address(frame))
+        if (auto coro = std::coroutine_handle<>::from_address(frame))
             coro.resume();
 
         std::get<1>(t) = true;
@@ -172,12 +170,12 @@ private:
     mutable void* frame; // Resumeable Handle
     union {
         writer* next = nullptr; // Next writer in channel
-        channel_type* channel;     // Channel to push this writer
+        channel_type* channel_;     // Channel to push this writer
     };
 
 private:
     explicit writer(channel_type& ch, pointer pv) noexcept
-        : value_ptr{pv}, frame{}, channel{std::addressof(ch)} {
+        : value_ptr{pv}, frame{}, channel_{std::addressof(ch)} {
     }
     writer(const writer&) noexcept = delete;
     writer& operator=(const writer&) noexcept = delete;
@@ -186,12 +184,12 @@ public:
     writer(writer&& rhs) noexcept {
         std::swap(value_ptr, rhs.value_ptr);
         std::swap(frame, rhs.frame);
-        std::swap(channel, rhs.channel);
+        std::swap(channel_, rhs.channel_);
     }
     writer& operator=(writer&& rhs) noexcept {
         std::swap(value_ptr, rhs.value_ptr);
         std::swap(frame, rhs.frame);
-        std::swap(channel, rhs.channel);
+        std::swap(channel_, rhs.channel_);
         return *this;
     }
     ~writer() noexcept = default;
@@ -199,19 +197,19 @@ public:
 public:
     bool await_ready() const {
         std::cout << __PRETTY_FUNCTION__ << std::endl;
-        if (channel->reader_list::is_empty()) {
+        if (channel_->reader_list::is_empty()) {
             return false;
         }
-        auto r = channel->reader_list::pop();
+        auto r = channel_->reader_list::pop();
         // exchange address & resumeable_handle
         std::swap(value_ptr, r->value_ptr);
         std::swap(frame, r->frame);
         return true;
     }
-    void await_suspend(stdx::coroutine_handle<> coro) {
+    void await_suspend(std::coroutine_handle<> coro) {
         std::cout << __PRETTY_FUNCTION__ << std::endl;
         // notice that next & chan are sharing memory
-        auto& ch = *(this->channel);
+        auto& ch = *(this->channel_);
 
         frame = coro.address(); // remember handle before push/unlock
         next = nullptr;         // clear to prevent confusing
@@ -224,7 +222,7 @@ public:
         if (frame == poison()) {
             return false;
         }
-        if (auto coro = stdx::coroutine_handle<>::from_address(frame))
+        if (auto coro = std::coroutine_handle<>::from_address(frame))
             coro.resume();
 
         return true;
@@ -276,14 +274,14 @@ public:
         while (repeat--) {
             while (!writers.is_empty()) {
                 auto w = writers.pop();
-                auto coro = stdx::coroutine_handle<>::from_address(w->frame);
+                auto coro = std::coroutine_handle<>::from_address(w->frame);
                 w->frame = poison();
 
                 coro.resume();
             }
             while (!readers.is_empty()) {
                 auto r = readers.pop();
-                auto coro = stdx::coroutine_handle<>::from_address(r->frame);
+                auto coro = std::coroutine_handle<>::from_address(r->frame);
                 r->frame = poison();
 
                 coro.resume();

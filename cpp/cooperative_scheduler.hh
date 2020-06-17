@@ -8,28 +8,32 @@
 #include <time.h>
 #include <cassert>
 #include <unistd.h>
-#include <iostream>
+#include <fmt/core.h>
 
 class cooperative_scheduler final {
 public:
     template<class... Args>
-    cooperative_scheduler(Args&&... args) noexcept {
+    cooperative_scheduler(Args&&... args) noexcept
+        : signal_stack(std::malloc(stack_size))
+    {
         just_me = this;
-        std::cout << "pid: " << getpid() << std::endl;
-        signal_stack = std::malloc(stacksize);
         assert(signal_stack);
+        // to prevent contexts invalidation
+        contexts.reserve((sizeof...(args))/2);
         make_contexts(std::forward<Args>(args)...);
         setup_signals();
         setup_timer();
         auto rc = std::atexit([]{
+            if constexpr (debug) {
+                fmt::print("start cleanup\n");
+            }
             // temporary workaround to silent memcheck
             // we need to be sure all fibers done their job
-            std::cout << "cleanup" << std::endl;
             for (auto i = 0u; i < just_me->contexts.size(); i++) {
                 auto &context = just_me->contexts[i];
                 std::free(context.uc_stack.ss_sp);
             }
-            free(just_me->signal_stack);
+            std::free(just_me->signal_stack);
             just_me->~cooperative_scheduler();
         });
         assert(rc == 0);
@@ -40,13 +44,13 @@ public:
     cooperative_scheduler& operator=(const cooperative_scheduler&) = delete;
 private:
     template<class Arg>
-    void make_contexts(void (*f) (Arg*), Arg &a) noexcept {
-        mkcontext(f, &a);
+    void make_contexts(void (*fiber) (Arg*), Arg &arg) noexcept {
+        make_context(fiber, &arg);
     }
 
     template<class Arg, class... Args>
-    void make_contexts(void (*f) (Arg*), Arg &a, Args&&... args) noexcept {
-        mkcontext(f, &a);
+    void make_contexts(void (*fiber) (Arg*), Arg &arg, Args&&... args) noexcept {
+        make_context(fiber, &arg);
         make_contexts(std::forward<Args>(args)...);
     }
 
@@ -54,22 +58,18 @@ private:
         assert(!just_me->contexts.empty());
         auto old_context = just_me->current_context;
         just_me->current_context = (just_me->current_context + 1) % just_me->contexts.size();
-        std::cout << "scheduling: fiber "  << old_context << " -> fiber " << just_me->current_context << std::endl;
+        if constexpr (debug) {
+            fmt::print("scheduling: fiber {} -> fiber {}\n", old_context, just_me->current_context);
+        }
         auto ptr = &(just_me->contexts[just_me->current_context]);
         setcontext(ptr);
     }
 
-    /*
-      Timer interrupt handler.
-      Creates a new context to run the scheduler in, masks signals, then swaps
-      contexts saving the previously executing thread and jumping to the
-      scheduler.
-    */
     static void timer_interrupt(int, siginfo_t*, void*) noexcept {
         // Create new scheduler context
         auto signal_context = &(just_me->signal_context);
         getcontext(signal_context);
-        signal_context->uc_stack =  {just_me->signal_stack, 0, stacksize};
+        signal_context->uc_stack =  {just_me->signal_stack, 0, stack_size};
         sigemptyset(&(signal_context->uc_sigmask));
         makecontext(signal_context, round_rubin_scheduler, 1);
 
@@ -78,7 +78,6 @@ private:
         swapcontext(ptr, signal_context);
     }
 
-    /* Set up SIGALRM signal handler */
     void setup_signals() noexcept {
         struct sigaction action;
         action.sa_sigaction = timer_interrupt;
@@ -96,18 +95,20 @@ private:
        stack, signal mask, and tell it which function to call.
     */
     template<class Arg>
-    void mkcontext(void (*function) (Arg*), Arg *a) noexcept {
+    void make_context(void (*fiber) (Arg*), Arg *a) noexcept {
         contexts.emplace_back();
-        auto uc = &contexts.back();
-        getcontext(uc);
-        auto stack = std::malloc(stacksize);
+        auto ucontext = &contexts.back();
+        getcontext(ucontext);
+        auto stack = std::malloc(stack_size);
         assert(stack);
-        uc->uc_stack = {stack, 0, stacksize};
-        auto rc = sigemptyset(&uc->uc_sigmask);
+        ucontext->uc_stack = {stack, 0, stack_size};
+        auto rc = sigemptyset(&ucontext->uc_sigmask);
         assert(rc >= 0);
 
-        makecontext(uc, reinterpret_cast<void (*)(void)>(function), 1, a);
-        std::cout << "context is " << uc << std::endl;
+        makecontext(ucontext, reinterpret_cast<void (*)(void)>(fiber), 1, a);
+        if constexpr (debug) {
+            fmt::print("context: {}\n", static_cast<void*>(ucontext));
+        }
     }
 
     static void setup_timer() noexcept {
@@ -117,7 +118,9 @@ private:
         assert(rc == 0);
     }
 
-    constexpr static auto stacksize = 16'384u;
+    constexpr static auto stack_size = 16'384u;
+    constexpr static auto debug = true;
+    static cooperative_scheduler* just_me;
     sigset_t signal_mask_set;
     // used only in timer_interrupt, no need for volatile
     ucontext_t signal_context;
@@ -125,7 +128,6 @@ private:
     void *signal_stack;
     std::vector<ucontext_t> contexts;
     unsigned current_context = 0u;
-    static cooperative_scheduler* just_me;
 };
 
 cooperative_scheduler* cooperative_scheduler::just_me = nullptr;
