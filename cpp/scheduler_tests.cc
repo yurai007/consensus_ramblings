@@ -1,11 +1,17 @@
-
 #include "cooperative_scheduler.hh"
 #include <fmt/core.h>
 #include <future>
-#include <coroutine>
+#ifdef __clang__
+    #include <experimental/coroutine>
+    namespace stdx = std::experimental;
+#else
+    #include <coroutine>
+    namespace stdx = std;
+#endif
 
+// expplicit cons sched
 template <typename R, typename... Args>
-struct std::coroutine_traits<std::future<R>, Args...> {
+struct stdx::coroutine_traits<std::future<R>, Args...> {
     // promise_type - part of coroutine state
     struct promise_type {
         std::promise<R> p;
@@ -14,16 +20,20 @@ struct std::coroutine_traits<std::future<R>, Args...> {
         void return_value(R v) {
             p.set_value(v);
         }
-        // cannot have simultanuelsy return_void with return_value
-        //void return_void() {}
         std::future<R> get_return_object() { return p.get_future(); }
         void unhandled_exception() { p.set_exception(std::current_exception()); }
     };
 };
 
-namespace naive {
+void fiber0(int *) {
+    fmt::print("func0: started\n");
+}
 
-static void fiber0(int *p) {
+void fiber00(int *) {
+    fmt::print("func00: started\n");
+}
+
+void fiber1(int *p) {
     fmt::print("fiber0: started\n");
     sleep(5);
     fmt::print("fiber0: before sleep\n");
@@ -32,7 +42,7 @@ static void fiber0(int *p) {
     fmt::print("fiber0: returning\n");
 }
 
-static void fiber1(int *p) {
+void fiber2(int *p) {
     fmt::print("fiber1: started\n");
     sleep(2);
     sleep(5);
@@ -41,13 +51,31 @@ static void fiber1(int *p) {
     fmt::print("fiber1: returning\n");
 }
 
-void test() {
-   int p1 = 123, p2 = 321;
-   cooperative_scheduler{fiber0, p1, fiber1, p2};
-   fmt::print("unreachable end of scope\n");
-}
+void test0() {
+    int p1 = 123;
+    cooperative_scheduler{fiber0, p1};
+    fmt::print("end of scope\n\n");
 }
 
+void test1() {
+    int p1 = 123, p2 =32;
+    cooperative_scheduler{fiber0, p1, fiber00, p2};
+    fmt::print("end of scope\n\n");
+}
+
+void test2() {
+   int p1 = 123, p2 = 321;
+   cooperative_scheduler{fiber1, p1, fiber2, p2};
+   fmt::print("end of scope\n\n");
+}
+
+void test3() {
+   int p1 = 123, p2 = 321, p3 = 3;
+   cooperative_scheduler{fiber00, p3, fiber1, p1, fiber2, p2};
+   fmt::print("end of scope\n\n");
+}
+
+// those hacks are not needed anymore
 namespace with_proper_cleanup {
 
 std::promise<bool> done;
@@ -84,12 +112,15 @@ static void fiber1(int *p) {
 void test() {
    int p1 = 123, p2 = 321;
    cooperative_scheduler{fiber0, p1, fiber1, p2};
-   fmt::print("unreachable end of scope\n");
+   fmt::print("end of scope\n\n");
 }
 }
 
 int main() {
-    //naive::test();
+    test0();
+    test1();
+    test2();
+    test3();
     with_proper_cleanup::test();
     return 0;
 }
