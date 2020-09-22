@@ -2,14 +2,18 @@
 #include "channel.hh"
 #include <boost/range/algorithm/for_each.hpp>
 #include <boost/range/irange.hpp>
+#include <fmt/core.h>
 #include <tuple>
 #include <map>
 #include <vector>
 #include <cassert>
-#include <iostream>
 #include <future>
 #include <stdexcept>
 #include <compare>
+
+struct Message {
+    virtual ~Message() = default;
+};
 
 #ifndef __clang__
 
@@ -33,33 +37,27 @@ concept CoroutineChannelAux = requires (Channel<T>& c, T &t, Writer &w, Reader &
 
 template< template <class U> class Channel, class T>
 concept CoroutineChannel = requires (Channel<T> &c) {
-    internal::CoroutineChannelAux<Channel, typename Channel<T>::value_type, typename Channel<T>::writer, typename Channel<T>::reader>;
+    internal::CoroutineChannelAux<Channel, typename Channel<T>::value_type, typename Channel<T>::Writer, typename Channel<T>::Reader>;
 };
 
-// it's important for implementation to have fully preemptable coroutine channel
-// TODO: trunk gcc-10 should accept that.
-static_assert(CoroutineChannel<channel>);
+static_assert(CoroutineChannel<channel, Message*>, "it's important for implementation to have fully preemptable coroutine channel");
 #endif
 
 enum class State { INITIAL, DONE };
 
-struct Message {
-    virtual ~Message() = default;
-};
-
-struct HeartBeat : Message {
+struct HeartBeat final : Message {
     HeartBeat(bool _done) noexcept : done(_done) {}
     bool done = false;
 };
 
-struct AppendEntriesReq : Message {
+struct AppendEntriesReq final : Message {
     AppendEntriesReq(const std::tuple<char, int> &_entry, int _term, int _prevIndex, int _prevTerm, int _leaderCommit) noexcept
         : entry(_entry), term(_term), prevIndex(_prevIndex), prevTerm(_prevTerm), leaderCommit(_leaderCommit) {}
     std::tuple<char, int> entry;
     int term, prevIndex, prevTerm, leaderCommit;
 };
 
-struct AppendEntriesResp : Message {
+struct AppendEntriesResp final : Message {
     AppendEntriesResp(int _term, bool _success) noexcept
         : term(_term), success(_success) {}
     int term;
@@ -97,13 +95,14 @@ protected:
     constexpr static bool debug = false;
 };
 
-class Follower : public Node {
+class Follower final : public Node {
 public:
     void run() override {
         state = State::INITIAL;
         currentTerm++;
         commitIndex = std::max(static_cast<int>(log.size()) - 1, 0);
-        std::cout << "Follower " << this << " starts" << std::endl;
+        const void *me = this;
+        fmt::print("Follower {} starts\n", me);
         while (!done(*receiveHeartbeat().get())) {
 
             auto appendEntries = receiveAppendEntriesReq().get();
@@ -133,19 +132,19 @@ public:
             if (apply) {
                 log.emplace_back(appendEntries->entry, appendEntries->term);
                 logState[id] = value;
-                std::cout << "Follower " << this << ": " << id << ":= " << value << std::endl;
+                fmt::print("Follower {}: {} := {}\n", me, id, value);
                 commitIndex++;
                 lastApplied++;
                 if (appendEntries->term > currentTerm) {
                     currentTerm = appendEntries->term;
                 }
             } else {
-                std::cout << "Follower " << this << " no consensus for " << id << std::endl;
+                fmt::print("Follower {}: no consensus for {}\n", me, id);
                 trackLog();
             }
         }
         state = State::DONE;
-        std::cout << "Follower: " << this << " done" << std::endl;
+        fmt::print("Follower {}: done\n", me);
         trackLog();
     }
     bool verifyLog(const std::vector<InternalLogEntry>&) const { return true; }
@@ -205,7 +204,7 @@ public:
     }
 };
 
-class Leader : public Node {
+class Leader final : public Node {
 public:
     Leader(std::vector<Follower> &_followers, const std::map<char, int> &_entriesToReplicate) :
         followers(_followers),
@@ -218,7 +217,7 @@ public:
     void run() override {
         state = State::INITIAL;
         currentTerm++;
-        std::cout << "Leader of term " << currentTerm << std::endl;
+        fmt::print("Leader of term {}\n", currentTerm);
          boost::for_each(entriesToReplicate, [this](auto &entry){
             auto [id, value] = entry;
             boost::for_each(followers, [](auto &&follower){
@@ -237,7 +236,7 @@ public:
                     auto expected = AppendEntriesResp(term, true);
 
                      if (response <=> expected != 0) {
-                        std::cout << "Leader: No consensus for " << id << " " << value << std::endl;
+                        fmt::print("Leader: No consensus for {} {}\n", id, value);
                         nextIndex[&it] = replicaNextIndex(&it) - 1;
                         if (replicaNextIndex(&it) >= 0) {
                             entry = log[replicaNextIndex(&it)].entry;
@@ -263,9 +262,9 @@ public:
             boost::for_each(followers, [this](auto &&follower){
                 nextIndex[&follower] = replicaNextIndex(&follower) + 1;
             });
-            std::cout << "Leader: " << id << " := " << value << std::endl;
+            fmt::print("Leader: {} := {}\n", id, value);
          });
-        std::cout << "Leader: done" << std::endl;
+        fmt::print("Leader: done\n");
     }
 
 private:
@@ -286,7 +285,7 @@ static void leaderFiber(Leader *_leader) {
     auto task = [_leader]() -> std::future<int> {
         try {
             _leader->run();
-        } catch (const std::exception &e) { std::cout << "Leader: failed with: " << e.what() << std::endl; }
+        } catch (const std::exception &e) { fmt::print("Leader: failed with {}\n", e.what());}
         co_return 0;
     };
     task().get();
@@ -298,7 +297,7 @@ static void followersFiber(std::vector<Follower> *_followers) {
             boost::for_each(*_followers, [](auto &&follower){
                 try {
                     follower.run();
-                } catch (...) {  std::cout << "Follower: failed" << std::endl; }
+                } catch (...) {  fmt::print("Follower: failed\n"); }
         });
         co_return 0;
     };
@@ -320,7 +319,7 @@ static void oneLeaderOneFollowerScenarioWithConsensus() {
     boost::for_each(followers, [&expectedLog](auto &&follower){
         assert(follower.verifyLog(expectedLog));
     });
-    std::cout << std::endl;
+    fmt::print("\n");
 }
 
 int main() {

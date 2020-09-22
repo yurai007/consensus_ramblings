@@ -1,12 +1,18 @@
 ﻿#pragma once
-
-#include <coroutine>
+#include <fmt/core.h>
 #include <mutex>
-#include <iostream>
 #include <future>
 
+#ifdef __clang__
+    #include <experimental/coroutine>
+    namespace stdx = std::experimental;
+#else
+    #include <coroutine>
+    namespace stdx = std;
+#endif
+
 template <typename R, typename... Args>
-struct std::coroutine_traits<std::future<R>, Args...> {
+struct stdx::coroutine_traits<std::future<R>, Args...> {
     // promise_type - part of coroutine state
     struct promise_type {
         std::promise<R> p;
@@ -72,7 +78,7 @@ public:
 
 private:
     using reader_list = typename channel_type::reader_list;
-    using writer = typename channel_type::writer;
+    using writer = typename channel_type::Writer;
     using writer_list = typename channel_type::writer_list;
 
     friend channel_type;
@@ -110,7 +116,7 @@ public:
 
 public:
     bool await_ready() const  {
-        std::cout << __PRETTY_FUNCTION__ << std::endl;
+        fmt::print("{}\n", __PRETTY_FUNCTION__);
         if (channel_->writer_list::is_empty()) {
             return false;
         }
@@ -120,8 +126,8 @@ public:
         std::swap(frame, w->frame);
         return true;
     }
-    void await_suspend(std::coroutine_handle<> coro) {
-        std::cout << __PRETTY_FUNCTION__ << std::endl;
+    void await_suspend(stdx::coroutine_handle<> coro) {
+        fmt::print("{}\n", __PRETTY_FUNCTION__);
         // notice that next & chan are sharing memory
         auto& ch = *(this->channel_);
         frame = coro.address(); // remember handle before push/unlock
@@ -130,7 +136,7 @@ public:
         ch.reader_list::push(this);
     }
     std::tuple<value_type, bool> await_resume() {
-        std::cout << __PRETTY_FUNCTION__ << std::endl;
+        fmt::print("{}\n", __PRETTY_FUNCTION__);
         auto t = std::make_tuple(value_type{}, false);
         // frame holds poision if the channel is going to be destroyed
         if (frame == poison())
@@ -140,7 +146,7 @@ public:
         // can destroy the writer coroutine
         auto& value = std::get<0>(t);
         value = std::move(*value_ptr);
-        if (auto coro = std::coroutine_handle<>::from_address(frame))
+        if (auto coro = stdx::coroutine_handle<>::from_address(frame))
             coro.resume();
 
         std::get<1>(t) = true;
@@ -157,7 +163,7 @@ public:
     using channel_type = channel<T>;
 
 private:
-    using reader = typename channel_type::reader;
+    using reader = typename channel_type::Reader;
     using reader_list = typename channel_type::reader_list;
     using writer_list = typename channel_type::writer_list;
 
@@ -196,7 +202,7 @@ public:
 
 public:
     bool await_ready() const {
-        std::cout << __PRETTY_FUNCTION__ << std::endl;
+        fmt::print("{}\n", __PRETTY_FUNCTION__);
         if (channel_->reader_list::is_empty()) {
             return false;
         }
@@ -206,8 +212,8 @@ public:
         std::swap(frame, r->frame);
         return true;
     }
-    void await_suspend(std::coroutine_handle<> coro) {
-        std::cout << __PRETTY_FUNCTION__ << std::endl;
+    void await_suspend(stdx::coroutine_handle<> coro) {
+        fmt::print("{}\n", __PRETTY_FUNCTION__);
         // notice that next & chan are sharing memory
         auto& ch = *(this->channel_);
 
@@ -217,12 +223,12 @@ public:
         ch.writer_list::push(this);
     }
     bool await_resume() {
-        std::cout << __PRETTY_FUNCTION__ << std::endl;
+        fmt::print("{}\n", __PRETTY_FUNCTION__);
         // frame holds poision if the channel is going to destroy
         if (frame == poison()) {
             return false;
         }
-        if (auto coro = std::coroutine_handle<>::from_address(frame))
+        if (auto coro = stdx::coroutine_handle<>::from_address(frame))
             coro.resume();
 
         return true;
@@ -238,15 +244,14 @@ public:
     using value_type = T;
     using pointer = value_type*;
     using reference = value_type&;
-
+    using Reader = reader<value_type>;
+    using Writer = writer<value_type>;
 private:
-    using reader = reader<value_type>;
-    using reader_list = list<reader>;
-    using writer = writer<value_type>;
-    using writer_list = list<writer>;
+    using reader_list = list<Reader>;
+    using writer_list = list<Writer>;
 
-    friend reader;
-    friend writer;
+    friend Reader;
+    friend Writer;
 public:
     channel(const channel&) noexcept = delete;
     channel(channel&&) noexcept = delete;
@@ -274,14 +279,14 @@ public:
         while (repeat--) {
             while (!writers.is_empty()) {
                 auto w = writers.pop();
-                auto coro = std::coroutine_handle<>::from_address(w->frame);
+                auto coro = stdx::coroutine_handle<>::from_address(w->frame);
                 w->frame = poison();
 
                 coro.resume();
             }
             while (!readers.is_empty()) {
                 auto r = readers.pop();
-                auto coro = std::coroutine_handle<>::from_address(r->frame);
+                auto coro = stdx::coroutine_handle<>::from_address(r->frame);
                 r->frame = poison();
 
                 coro.resume();
@@ -290,11 +295,11 @@ public:
     }
 
 public:
-    writer write(reference ref) noexcept {
-        return writer{*this, std::addressof(ref)};
+    Writer write(reference ref) noexcept {
+        return Writer{*this, std::addressof(ref)};
     }
-    reader read() noexcept {
+    Reader read() noexcept {
         reader_list& readers = *this;
-        return reader{*this};
+        return Reader{*this};
     }
 };

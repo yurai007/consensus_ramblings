@@ -1,4 +1,5 @@
 #include "cooperative_scheduler.hh"
+#include "channel.hh"
 #include <fmt/core.h>
 #include <future>
 #ifdef __clang__
@@ -9,21 +10,7 @@
     namespace stdx = std;
 #endif
 
-// expplicit cons sched
-template <typename R, typename... Args>
-struct stdx::coroutine_traits<std::future<R>, Args...> {
-    // promise_type - part of coroutine state
-    struct promise_type {
-        std::promise<R> p;
-        suspend_never initial_suspend() { return {}; }
-        suspend_never final_suspend() { return {}; }
-        void return_value(R v) {
-            p.set_value(v);
-        }
-        std::future<R> get_return_object() { return p.get_future(); }
-        void unhandled_exception() { p.set_exception(std::current_exception()); }
-    };
-};
+namespace scheduler {
 
 void fiber0(int *) {
     fmt::print("func0: started\n");
@@ -74,8 +61,10 @@ void test3() {
    cooperative_scheduler{fiber00, p3, fiber1, p1, fiber2, p2};
    fmt::print("end of scope\n\n");
 }
+}
 
 // those hacks are not needed anymore
+#if 0
 namespace with_proper_cleanup {
 
 std::promise<bool> done;
@@ -115,12 +104,64 @@ void test() {
    fmt::print("end of scope\n\n");
 }
 }
+#endif
+
+namespace channels {
+
+channel<int> _channel1, _channel2;
+
+std::future<int> one_fiber() {
+    fmt::print("{}\n", __PRETTY_FUNCTION__);
+    // fiber 1
+    auto [rmsg, ok] = co_await _channel1.read();
+    fmt::print("Read done  {}\n", rmsg);
+    // Still fiber 1
+    auto msg = 1;
+    co_await _channel1.write(msg);
+    fmt::print("Write done\n");
+    co_return 0;
+}
+
+std::promise<bool> done;
+std::future<bool> donef = done.get_future();
+
+void fiber1(int*) {
+    auto task = []() -> std::future<int> {
+        fmt::print("fiber1: start\n");
+        auto [msg, ok] = co_await _channel2.read();
+        fmt::print("fiber1: end with {}\n", msg);
+        co_return msg;
+    };
+    assert(task().get() == 123);
+    done.set_value(true);
+}
+
+void fiber2(int*) {
+    auto task = []() -> std::future<int> {
+        fmt::print("fiber2: start\n");
+        auto msg = 123;
+        co_await _channel2.write(msg);
+        fmt::print("fiber2: end\n");
+        co_return 0;
+    };
+    assert(task().get() == 0);
+    donef.get();
+}
+
+static void two_fibers() {
+    fmt::print("{}\n", __PRETTY_FUNCTION__);
+    auto i = 1, j = 2;
+    cooperative_scheduler{fiber1, i, fiber2, j};
+}
+
+}
 
 int main() {
-    test0();
-    test1();
-    test2();
-    test3();
-    with_proper_cleanup::test();
+    scheduler::test0();
+    scheduler::test1();
+    scheduler::test2();
+    scheduler::test3();
+    channels::one_fiber();
+    channels::two_fibers();
     return 0;
 }
