@@ -22,7 +22,7 @@ public:
         assert(scheduler_stack);
         make_contexts(std::forward<Args>(args)...);
         setup_signals();
-        setup_timer();
+        setup_timer(timer_us);
         assert(contexts.size() == contexts_number);
         init_scheduler_context();
         prefix_size = just_me->contexts.size();
@@ -33,8 +33,9 @@ public:
     cooperative_scheduler& operator=(const cooperative_scheduler&) = delete;
     ~cooperative_scheduler() {
         if constexpr (debug) {
-            fmt::print("start cleanup\n");
+            fmt::print("cleanup\n");
         }
+        setup_timer(0);
         for (auto i = 0u; i < just_me->contexts.size(); i++) {
             auto &context = just_me->contexts[i];
             std::free(context.uc_stack.ss_sp);
@@ -123,7 +124,7 @@ private:
         }
     }
 
-    static void setup_timer() noexcept {
+    static void setup_timer(long timer_us) noexcept {
         timeval tv = {0, timer_us};
         itimerval it = {tv, tv};
         auto rc = setitimer(ITIMER_REAL, &it, nullptr);

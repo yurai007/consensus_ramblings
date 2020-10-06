@@ -10,6 +10,49 @@
     namespace stdx = std;
 #endif
 
+    // those hacks are not needed anymore
+    #if 0
+    namespace with_proper_cleanup {
+
+    std::promise<bool> done;
+    std::future<bool> donef = done.get_future();
+
+    static void fiber0(int *p) {
+        auto task = [p]() -> std::future<int> {
+            fmt::print("fiber0: started\n");
+            auto n = sleep(5);
+            fmt::print("fiber0: before 2nd sleep {}s\n", n);
+            sleep(5);
+            fmt::print("fiber0: {}\n", *p);
+            fmt::print("fiber0: returning\n");
+            co_return 0;
+        };
+        task().get();
+        donef.get();
+    }
+
+    static void fiber1(int *p) {
+        auto task = [p]() -> std::future<int> {
+            fmt::print("fiber1: started\n");
+            auto n = sleep(2);
+            n = sleep(5);
+            fmt::print("fiber1: after sleep {}s\n", n);
+            fmt::print("fiber1: {}\n", *p);
+            fmt::print("fiber1: returning\n");
+            co_return 0;
+        };
+        task().get();
+        done.set_value(true);
+    }
+
+    void test() {
+       int p1 = 123, p2 = 321;
+       cooperative_scheduler{fiber0, p1, fiber1, p2};
+       fmt::print("end of scope\n\n");
+    }
+    }
+    #endif
+
 namespace scheduler {
 
 void fiber0(int *) {
@@ -45,66 +88,72 @@ void test0() {
 }
 
 void test1() {
-    int p1 = 123, p2 =32;
+    auto p1 = 123, p2 =32;
     cooperative_scheduler{fiber0, p1, fiber00, p2};
     fmt::print("end of scope\n\n");
 }
 
 void test2() {
-   int p1 = 123, p2 = 321;
+   auto p1 = 123, p2 = 321;
    cooperative_scheduler{fiber1, p1, fiber2, p2};
    fmt::print("end of scope\n\n");
 }
 
 void test3() {
-   int p1 = 123, p2 = 321, p3 = 3;
-   cooperative_scheduler{fiber00, p3, fiber1, p1, fiber2, p2};
-   fmt::print("end of scope\n\n");
+    {
+        auto p1 = 123, p2 = 321, p3 = 3;
+        cooperative_scheduler{fiber00, p3, fiber1, p1, fiber2, p2};
+        fmt::print("end of scope\n\n");
+    }
+    // to make sure timer was disabled during cooperative_scheduler destruction
+    sleep(3);
 }
-}
-
-// those hacks are not needed anymore
-#if 0
-namespace with_proper_cleanup {
 
 std::promise<bool> done;
 std::future<bool> donef = done.get_future();
 
-static void fiber0(int *p) {
-    auto task = [p]() -> std::future<int> {
-        fmt::print("fiber0: started\n");
-        auto n = sleep(5);
-        fmt::print("fiber0: before 2nd sleep {}s\n", n);
-        sleep(5);
-        fmt::print("fiber0: {}\n", *p);
-        fmt::print("fiber0: returning\n");
-        co_return 0;
-    };
-    task().get();
-    donef.get();
+template<class T>
+std::future<T> make_ready_future(T v) {
+    std::promise<T> p;
+    auto f = p.get_future();
+    // it throws in libstdc++ if -lpthread is missing!
+    p.set_value(v);
+    return f;
 }
 
-static void fiber1(int *p) {
-    auto task = [p]() -> std::future<int> {
-        fmt::print("fiber1: started\n");
-        auto n = sleep(2);
-        n = sleep(5);
-        fmt::print("fiber1: after sleep {}s\n", n);
-        fmt::print("fiber1: {}\n", *p);
-        fmt::print("fiber1: returning\n");
-        co_return 0;
+void fiber3(int*) {
+    auto task = []() -> std::future<int> {
+        // blocking call is done immediately...
+        fmt::print("before sleep\n");
+        sleep(3);
+        fmt::print("after sleep\n");
+        return make_ready_future<int>(123);
     };
-    task().get();
+    assert(task().get() == 123);
+    fmt::print("done set\n");
     done.set_value(true);
 }
 
-void test() {
+void fiber4(int*) {
+    auto task = []() -> std::future<int> {
+        return make_ready_future<int>(0);
+    };
+    auto t = task();
+    fmt::print("check\n");
+    // ...but here we are waiting
+    assert(t.get() == 0);
+    fmt::print("done get\n");
+    donef.get();
+    fmt::print("done ok\n");
+}
+
+static void test4() {
    int p1 = 123, p2 = 321;
-   cooperative_scheduler{fiber0, p1, fiber1, p2};
-   fmt::print("end of scope\n\n");
+   cooperative_scheduler{fiber3, p1, fiber4, p2};
+   fmt::print("end of scope test4\n\n");
 }
+
 }
-#endif
 
 namespace channels {
 
@@ -144,7 +193,9 @@ void fiber2(int*) {
         fmt::print("fiber2: end\n");
         co_return 0;
     };
-    assert(task().get() == 0);
+    auto t = task();
+    fmt::print("check\n");
+    assert(t.get() == 0);
     donef.get();
 }
 
@@ -153,7 +204,6 @@ static void two_fibers() {
     auto i = 1, j = 2;
     cooperative_scheduler{fiber1, i, fiber2, j};
 }
-
 }
 
 int main() {
@@ -161,6 +211,8 @@ int main() {
     scheduler::test1();
     scheduler::test2();
     scheduler::test3();
+    scheduler::test4();
+
     channels::one_fiber();
     channels::two_fibers();
     return 0;

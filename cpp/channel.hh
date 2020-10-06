@@ -261,6 +261,7 @@ public:
 
     ~channel() noexcept(false)
     {
+        fmt::print("{}\n", __PRETTY_FUNCTION__);
         writer_list& writers = *this;
         reader_list& readers = *this;
         //

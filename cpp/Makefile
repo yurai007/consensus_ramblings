@@ -10,7 +10,7 @@ CXXFLAGS += -fsanitize=address -fsanitize-recover=address -fsanitize=undefined -
 gcc: CXX := g++
 gcc: CXXFLAGS = -Wall -W -Wextra -Wshadow -Wpedantic -Wformat-security -Walloca -Wduplicated-branches -g -std=c++20 -fconcepts -fconcepts-diagnostics-depth=5 -fcoroutines
 gcc: CXXFLAGS += -fstack-protector -fsanitize=address -fsanitize-recover=address -fsanitize=undefined -fsanitize-address-use-after-scope -fsanitize=signed-integer-overflow -fsanitize=vptr
-gcc: LDFLAGS = -lfmt
+gcc: LDFLAGS = -lfmt -lpthread
 gcc: scheduler_channel_tests.cc raft.cc
 	$(CXX) $(CXXFLAGS) scheduler_channel_tests.cc -o scheduler_channel_tests $(LDFLAGS)
 	$(CXX) $(CXXFLAGS) raft.cc -o raft $(LDFLAGS)
@@ -18,7 +18,7 @@ gcc: scheduler_channel_tests.cc raft.cc
 clang: CXX := clang++
 clang: CXXFLAGS = -Wall -W -g -std=c++20 -fcoroutines-ts -Wno-c99-extensions -Wno-c++98-compat-pedantic -stdlib=libc++
 clang: CXXFLAGS += -fsanitize=undefined -fsanitize-recover=address -fsanitize-address-use-after-scope -fsanitize=signed-integer-overflow -fsanitize=vptr
-clang: LDFLAGS = -lfmt
+clang: LDFLAGS = -lfmt -lpthread
 clang: scheduler_channel_tests.cc raft.cc
 	$(CXX) $(CXXFLAGS) scheduler_channel_tests.cc -o scheduler_channel_tests_cl $(LDFLAGS)
 	$(CXX) $(CXXFLAGS) raft.cc -o raft_cl $(LDFLAGS)
