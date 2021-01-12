@@ -218,7 +218,7 @@ public:
         state = State::INITIAL;
         currentTerm++;
         fmt::print("Leader of term {}\n", currentTerm);
-         boost::for_each(entriesToReplicate, [this](auto &entry){
+        boost::for_each(entriesToReplicate, [this](auto &entry){
             auto [id, value] = entry;
             boost::for_each(followers, [](auto &&follower){
                 follower.sendHeartbeat(false).get(); // FIXME: do in parallel + when_all helper

@@ -2,6 +2,11 @@
 #include "channel.hh"
 #include <fmt/core.h>
 #include <future>
+
+#include <ucontext.h>
+#include <sys/mman.h>
+#include <valgrind/valgrind.h>
+
 #ifdef __clang__
     #include <experimental/coroutine>
     namespace stdx = std::experimental;
@@ -206,6 +211,53 @@ static void two_fibers() {
 }
 }
 
+namespace channels_msgs {
+
+struct Msg {
+    unsigned x;
+};
+
+channel<std::unique_ptr<Msg>> rpc_channel;
+std::promise<bool> done;
+std::future<bool> donef = done.get_future();
+
+static void producer(int*) {
+    auto task = []() -> std::future<int> {
+        fmt::print("producer: start\n");
+        for (auto i = 1u; i <= 5u; i++) {
+            auto msg = std::make_unique<Msg>(Msg{i*i});
+            co_await rpc_channel.write(msg);
+            fmt::print("producer wrote\n");
+        }
+        fmt::print("producer: end\n");
+        co_return 0;
+    };
+    task().get();
+    done.set_value(true);
+}
+
+static void consumer(int*) {
+    auto task = []() -> std::future<int> {
+        fmt::print("consumer: start\n");
+        for (auto i = 1; i <= 5; i++) {
+            auto [msg, ok] = co_await rpc_channel.read();
+            fmt::print("consumer: {}\n", msg->x);
+        }
+        fmt::print("consumer: end\n");
+        co_return 0;
+    };
+    task().get();
+    donef.get();
+}
+
+static void test() {
+     fmt::print("{}\n", __PRETTY_FUNCTION__);
+     auto i = 1, j = 2;
+     cooperative_scheduler{producer, i, consumer, j};
+}
+
+}
+
 int main() {
     scheduler::test0();
     scheduler::test1();
@@ -215,5 +267,6 @@ int main() {
 
     channels::one_fiber();
     channels::two_fibers();
+    channels_msgs::test();
     return 0;
 }

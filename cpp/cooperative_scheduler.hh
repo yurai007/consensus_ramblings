@@ -9,6 +9,7 @@
 #include <cassert>
 #include <unistd.h>
 #include <fmt/core.h>
+#include <valgrind/valgrind.h>
 
 class cooperative_scheduler final {
 public:
@@ -20,6 +21,8 @@ public:
         assert(contexts_number > 0u);
         just_me = this;
         assert(scheduler_stack);
+        // to prevent contexts pointers invalidation
+        contexts.reserve(contexts_number);
         make_contexts(std::forward<Args>(args)...);
         setup_signals();
         setup_timer(timer_us);
@@ -36,8 +39,12 @@ public:
             fmt::print("cleanup\n");
         }
         setup_timer(0);
+        for (auto ms : memcheck_stacks) {
+            VALGRIND_STACK_DEREGISTER(ms);
+        }
         for (auto i = 0u; i < just_me->contexts.size(); i++) {
             auto &context = just_me->contexts[i];
+
             std::free(context.uc_stack.ss_sp);
         }
         std::free(just_me->scheduler_stack);
@@ -99,6 +106,9 @@ private:
         auto scheduler_context = &(just_me->scheduler_context);
         auto rc = getcontext(scheduler_context);
         assert(rc == 0);
+        auto stack = reinterpret_cast<char*>(just_me->scheduler_stack);
+        auto ret = VALGRIND_STACK_REGISTER(stack, stack + stack_size);
+        memcheck_stacks.emplace_back(ret);
         scheduler_context->uc_stack =  {just_me->scheduler_stack, 0, stack_size};
         scheduler_context->uc_link = &just_me->main_context;
         sigemptyset(&(scheduler_context->uc_sigmask));
@@ -113,6 +123,9 @@ private:
         assert(rc == 0);
         auto stack = std::malloc(stack_size);
         assert(stack);
+        auto stack_ptr =  reinterpret_cast<char*>(stack);
+        auto ret = VALGRIND_STACK_REGISTER(stack_ptr, stack_ptr + stack_size);
+        memcheck_stacks.emplace_back(ret);
         uc->uc_stack = {stack, 0, stack_size};
         uc->uc_link = &scheduler_context;
         rc = sigemptyset(&uc->uc_sigmask);
@@ -141,6 +154,8 @@ private:
     // global interrupt stack
     void *scheduler_stack;
     std::vector<ucontext_t> contexts;
+    std::vector<unsigned> memcheck_stacks;
+
     ucontext_t main_context;
     unsigned current_context = 0u;
     unsigned prefix_size;

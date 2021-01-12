@@ -226,10 +226,13 @@ public:
         fmt::print("{}\n", __PRETTY_FUNCTION__);
         // frame holds poision if the channel is going to destroy
         if (frame == poison()) {
+            fmt::print("poison\n");
             return false;
         }
-        if (auto coro = stdx::coroutine_handle<>::from_address(frame))
+        if (auto coro = stdx::coroutine_handle<>::from_address(frame)) {
+            fmt::print("coro.resume\n");
             coro.resume();
+        }
 
         return true;
     }
