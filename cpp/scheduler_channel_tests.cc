@@ -15,7 +15,8 @@
     namespace stdx = std;
 #endif
 
-    // those hacks are not needed anymore
+    // those hacks are not needed anymore - completed fibers are removed from
+    // scheduler and the rest continue execution
     #if 0
     namespace with_proper_cleanup {
 
@@ -114,9 +115,6 @@ void test3() {
     sleep(3);
 }
 
-std::promise<bool> done;
-std::future<bool> donef = done.get_future();
-
 template<class T>
 std::future<T> make_ready_future(T v) {
     std::promise<T> p;
@@ -135,8 +133,6 @@ void fiber3(int*) {
         return make_ready_future<int>(123);
     };
     assert(task().get() == 123);
-    fmt::print("done set\n");
-    done.set_value(true);
 }
 
 void fiber4(int*) {
@@ -148,8 +144,6 @@ void fiber4(int*) {
     // ...but here we are waiting
     assert(t.get() == 0);
     fmt::print("done get\n");
-    donef.get();
-    fmt::print("done ok\n");
 }
 
 static void test4() {
@@ -176,9 +170,6 @@ std::future<int> one_fiber() {
     co_return 0;
 }
 
-std::promise<bool> done;
-std::future<bool> donef = done.get_future();
-
 void fiber1(int*) {
     auto task = []() -> std::future<int> {
         fmt::print("fiber1: start\n");
@@ -187,7 +178,6 @@ void fiber1(int*) {
         co_return msg;
     };
     assert(task().get() == 123);
-    done.set_value(true);
 }
 
 void fiber2(int*) {
@@ -201,7 +191,6 @@ void fiber2(int*) {
     auto t = task();
     fmt::print("check\n");
     assert(t.get() == 0);
-    donef.get();
 }
 
 static void two_fibers() {
@@ -218,8 +207,6 @@ struct Msg {
 };
 
 channel<std::unique_ptr<Msg>> rpc_channel;
-std::promise<bool> done;
-std::future<bool> donef = done.get_future();
 
 static void producer(int*) {
     auto task = []() -> std::future<int> {
@@ -233,7 +220,6 @@ static void producer(int*) {
         co_return 0;
     };
     task().get();
-    done.set_value(true);
 }
 
 static void consumer(int*) {
@@ -247,7 +233,6 @@ static void consumer(int*) {
         co_return 0;
     };
     task().get();
-    donef.get();
 }
 
 static void test() {

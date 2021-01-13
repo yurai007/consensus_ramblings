@@ -11,6 +11,32 @@
     namespace stdx = std;
 #endif
 
+
+#ifndef __clang__
+namespace internal {
+
+template<class T>
+concept Awaiter = requires(T &t) {
+    {t.await_ready() } -> std::same_as<bool>;
+    {t.await_suspend(stdx::coroutine_handle<>{}) } -> std::same_as<void>;
+    {t.await_resume() } -> std::same_as<bool>;
+};
+
+template <template <class U> class Channel, class T, class Writer, class Reader>
+concept CoroutineChannelAux = requires (Channel<T>& c, T &t, Writer &w, Reader &r) {
+    {c.write(t)} noexcept -> std::same_as<Writer>;
+    {c.read()} noexcept -> std::same_as<Reader>;
+    Awaiter<Writer>;
+    Awaiter<Reader>;
+};
+}
+
+template< template <class U> class Channel, class T>
+concept CoroutineChannel = requires (Channel<T> &c) {
+    internal::CoroutineChannelAux<Channel, typename Channel<T>::value_type, typename Channel<T>::Writer, typename Channel<T>::Reader>;
+};
+#endif
+
 template <typename R, typename... Args>
 struct stdx::coroutine_traits<std::future<R>, Args...> {
     // promise_type - part of coroutine state
@@ -136,7 +162,9 @@ public:
         ch.reader_list::push(this);
     }
     std::tuple<value_type, bool> await_resume() {
-        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        // WTF??
+        // fmt::print("{} {}\n", __PRETTY_FUNCTION__);
+        fmt::print("{}", __PRETTY_FUNCTION__);
         auto t = std::make_tuple(value_type{}, false);
         // frame holds poision if the channel is going to be destroyed
         if (frame == poison())
@@ -146,6 +174,11 @@ public:
         // can destroy the writer coroutine
         auto& value = std::get<0>(t);
         value = std::move(*value_ptr);
+        if constexpr(std::is_pointer<T>::value) {
+            fmt::print(" T = {}\n", typeid(*value).name());
+        } else {
+            fmt::print("\n");
+        }
         if (auto coro = stdx::coroutine_handle<>::from_address(frame))
             coro.resume();
 

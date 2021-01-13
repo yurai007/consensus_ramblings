@@ -16,31 +16,7 @@ struct Message {
 };
 
 #ifndef __clang__
-
-namespace internal {
-
-template<class T>
-concept Awaiter = requires(T &t) {
-    {t.await_ready() } -> std::same_as<bool>;
-    {t.await_suspend(stdx::coroutine_handle<>{}) } -> std::same_as<void>;
-    {t.await_resume() } -> std::same_as<bool>;
-};
-
-template <template <class U> class Channel, class T, class Writer, class Reader>
-concept CoroutineChannelAux = requires (Channel<T>& c, T &t, Writer &w, Reader &r) {
-    {c.write(t)} noexcept -> std::same_as<Writer>;
-    {c.read()} noexcept -> std::same_as<Reader>;
-    Awaiter<Writer>;
-    Awaiter<Reader>;
-};
-}
-
-template< template <class U> class Channel, class T>
-concept CoroutineChannel = requires (Channel<T> &c) {
-    internal::CoroutineChannelAux<Channel, typename Channel<T>::value_type, typename Channel<T>::Writer, typename Channel<T>::Reader>;
-};
-
-static_assert(CoroutineChannel<channel, Message*>, "it's important for implementation to have fully preemptable coroutine channel");
+    static_assert(CoroutineChannel<channel, Message*>, "it's important for implementation to have fully preemptable coroutine channel");
 #endif
 
 enum class State { INITIAL, DONE };
@@ -100,17 +76,17 @@ public:
     void run() override {
         state = State::INITIAL;
         currentTerm++;
-        commitIndex = std::max(static_cast<int>(log.size()) - 1, 0);
+        const auto logSize = static_cast<int>(log.size());
+        commitIndex = std::max(logSize - 1, 0);
         const void *me = this;
-        fmt::print("Follower {} starts\n", me);
+        fmt::print("Follower {}: starts\n", me);
         while (!done(*receiveHeartbeat().get())) {
-
             auto appendEntries = receiveAppendEntriesReq().get();
             auto apply = true;
             auto prevIndex = appendEntries->prevIndex;
             auto prevTerm = appendEntries->prevTerm;
             if (prevIndex >= 0) {
-                if (prevIndex < log.size()) {
+                if (prevIndex < logSize) {
                     // [2]
                     if (log[prevIndex].term != prevTerm) {
                         apply = false;
@@ -118,7 +94,7 @@ public:
                 } else {
                     apply = false;
                 }
-                if (prevIndex + 1 < log.size()) {
+                if (prevIndex + 1 < logSize) {
                     // [3]
                     if (log[prevIndex + 1].term != appendEntries->term) {
                         // cleanup because of inconsistency, leave only log[0..prevIndex] prefix,
@@ -127,16 +103,18 @@ public:
                     }
                 }
             }
-            sendAppendEntriesResp(AppendEntriesResp(appendEntries->term, apply));
-            auto [id, value] = appendEntries->entry;
+            auto appendEntries_cp = std::make_unique<AppendEntriesReq>(*appendEntries);
+            // at this point previous msg from channel ends lifetime so we need copy it
+            sendAppendEntriesResp(AppendEntriesResp(appendEntries->term, apply)).get();
+            auto [id, value] = appendEntries_cp->entry;
             if (apply) {
-                log.emplace_back(appendEntries->entry, appendEntries->term);
+                log.emplace_back(appendEntries_cp->entry, appendEntries_cp->term);
                 logState[id] = value;
                 fmt::print("Follower {}: {} := {}\n", me, id, value);
                 commitIndex++;
                 lastApplied++;
-                if (appendEntries->term > currentTerm) {
-                    currentTerm = appendEntries->term;
+                if (appendEntries_cp->term > currentTerm) {
+                    currentTerm = appendEntries_cp->term;
                 }
             } else {
                 fmt::print("Follower {}: no consensus for {}\n", me, id);
@@ -228,9 +206,10 @@ public:
             // x = x, as workaround for http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2017/p0588r1.html
             boost::for_each(followers, [this, entry = std::make_tuple(entry.first, entry.second), id = id, value = value, followerIsDone = false](auto &&it) mutable {
                  do {
-                    auto prevIndex = std::min(replicaNextIndex(&it) - 1, static_cast<int>(log.size()) - 1);
+                    const auto logSize = static_cast<int>(log.size());
+                    auto prevIndex = std::min(replicaNextIndex(&it) - 1, logSize - 1);
                     auto prevTerm = (prevIndex >= 0)? log[prevIndex].term  : 0;
-                    auto term =  (prevIndex + 1 >= 0 && prevIndex + 1 < log.size()) ? log[prevIndex + 1].term  : currentTerm;
+                    auto term =  (prevIndex + 1 >= 0 && prevIndex + 1 < logSize) ? log[prevIndex + 1].term  : currentTerm;
                     it.sendAppendEntriesReq(AppendEntriesReq(entry, term, prevIndex, prevTerm, commitIndex)).get();
                     auto response = *it.receiveAppendEntriesResp().get();
                     auto expected = AppendEntriesResp(term, true);
@@ -247,7 +226,7 @@ public:
                         followerIsDone = true;
                     } else {
                         nextIndex[&it] = replicaNextIndex(&it) + 1;
-                        if (replicaNextIndex(&it) < log.size()) {
+                        if (replicaNextIndex(&it) < logSize) {
                             entry = log[replicaNextIndex(&it)].entry;
                         } else {
                             entry = std::tie(id, value);
@@ -264,6 +243,9 @@ public:
             });
             fmt::print("Leader: {} := {}\n", id, value);
          });
+        boost::for_each(followers, [this](auto &&it){
+            it.sendHeartbeat(true).get();
+        });
         fmt::print("Leader: done\n");
     }
 
@@ -278,40 +260,34 @@ private:
      }
 };
 
-std::promise<bool> done;
-std::future<bool> donef = done.get_future();
 
-static void leaderFiber(Leader *_leader) {
-    auto task = [_leader]() -> std::future<int> {
+static void leaderFiber(Leader *leader) {
+    auto task = [leader]() -> std::future<int> {
         try {
-            _leader->run();
+            leader->run();
         } catch (const std::exception &e) { fmt::print("Leader: failed with {}\n", e.what());}
         co_return 0;
     };
     task().get();
-    donef.get();
 }
 
-static void followersFiber(std::vector<Follower> *_followers) {
-    auto task = [_followers]() -> std::future<int> {
-            boost::for_each(*_followers, [](auto &&follower){
-                try {
-                    follower.run();
-                } catch (...) {  fmt::print("Follower: failed\n"); }
-        });
-        co_return 0;
+static void followerFiber(Follower *follower) {
+    auto task = [follower]() -> std::future<int> {
+         try {
+             follower->run();
+         } catch (...) {  fmt::print("Follower: failed\n"); }
+         co_return 0;
     };
     task().get();
-    done.set_value(true);
 }
 
 static void launchLeaderAndFollowers(Leader &leader, std::vector<Follower> &followers) {
-    cooperative_scheduler{leaderFiber, leader, followersFiber, followers};
+    cooperative_scheduler{leaderFiber, leader, followerFiber, followers[0]};
 }
 
 static void oneLeaderOneFollowerScenarioWithConsensus() {
-    std::vector<Follower> followers(1u);
-    std::map<char, int> entriesToReplicate{{'x', 1}, {'y', 2}};
+    auto followers = std::vector<Follower>(1u);
+    auto entriesToReplicate = std::map<char, int> {{'x', 1},{'y', 2}};
     auto leader = Leader(followers, entriesToReplicate);
     launchLeaderAndFollowers(leader, followers);
     auto expectedLog = std::vector{InternalLogEntry{std::tuple{'x', 1}, 1},
