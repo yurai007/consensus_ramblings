@@ -35,7 +35,7 @@ public:
     cooperative_scheduler(const cooperative_scheduler&) = delete;
     cooperative_scheduler& operator=(const cooperative_scheduler&) = delete;
     ~cooperative_scheduler() {
-        if constexpr (debug) {
+        if (debug) {
             fmt::print("cleanup\n");
         }
         setup_timer(0);
@@ -49,6 +49,8 @@ public:
         }
         std::free(just_me->scheduler_stack);
     }
+
+     static bool debug;
 private:
     template<class Arg>
     void make_contexts(void (*fiber) (Arg*), Arg &arg) noexcept {
@@ -73,7 +75,7 @@ private:
         assert(!just_me->contexts.empty());
         if (prefix_size > 0) {
             just_me->current_context = (just_me->current_context + 1) % prefix_size;
-            if constexpr (debug) {
+            if (debug) {
                 fmt::print("scheduling: fiber {} -> fiber {}\n", old_context, just_me->current_context);
             }
             auto ptr = &(just_me->contexts[just_me->current_context]);
@@ -132,7 +134,7 @@ private:
         assert(rc >= 0);
         auto ptr = reinterpret_cast<void (*)(void)>(fiber);
         makecontext(uc, ptr, 1, a);
-        if constexpr (debug) {
+        if (debug) {
             fmt::print("context: {}\n", static_cast<void*>(uc));
         }
     }
@@ -145,8 +147,7 @@ private:
     }
 
     constexpr static auto stack_size = 16'384u;
-    constexpr static auto debug = true;
-    constexpr static auto timer_us = (debug)? 100'000 : 1'000; // 100ms or 1ms
+    static int timer_us;
     static cooperative_scheduler* just_me;
     sigset_t signal_mask_set;
     // used only in scheduler_interrupt, no need for volatile
@@ -164,3 +165,5 @@ private:
 
 cooperative_scheduler* cooperative_scheduler::just_me = nullptr;
 volatile bool cooperative_scheduler::by_interrupt = false;
+bool cooperative_scheduler::debug = true;
+int cooperative_scheduler::timer_us = (debug)? 100'000 : 10'000; // 100ms or 10ms

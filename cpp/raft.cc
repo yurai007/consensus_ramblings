@@ -281,15 +281,33 @@ static void followerFiber(Follower *follower) {
     task().get();
 }
 
-static void launchLeaderAndFollowers(Leader &leader, std::vector<Follower> &followers) {
-    cooperative_scheduler{leaderFiber, leader, followerFiber, followers[0]};
+template<class... Args>
+static void launchLeaderAndFollowers(Args&&... args) {
+    cooperative_scheduler{ std::forward<Args>(args)...};
 }
 
 static void oneLeaderOneFollowerScenarioWithConsensus() {
     auto followers = std::vector<Follower>(1u);
     auto entriesToReplicate = std::map<char, int> {{'x', 1},{'y', 2}};
     auto leader = Leader(followers, entriesToReplicate);
-    launchLeaderAndFollowers(leader, followers);
+    launchLeaderAndFollowers(leaderFiber, leader, followerFiber, followers[0]);
+    auto expectedLog = std::vector{InternalLogEntry{std::tuple{'x', 1}, 1},
+                                   InternalLogEntry{std::tuple{'y', 2}, 1} };
+    boost::for_each(followers, [&expectedLog](auto &&follower){
+        assert(follower.verifyLog(expectedLog));
+    });
+    fmt::print("\n");
+}
+
+static void oneLeaderManyFollowersScenarioWithConsensus() {
+    auto followers = std::vector<Follower>(12u);
+    auto entriesToReplicate = std::map<char, int> {{'x', 1},{'y', 2}};
+    auto leader = Leader(followers, entriesToReplicate);
+    cooperative_scheduler::debug = false;
+    launchLeaderAndFollowers(leaderFiber, leader, followerFiber, followers[0], followerFiber, followers[1],
+            followerFiber, followers[2], followerFiber, followers[3], followerFiber, followers[4], followerFiber, followers[5],
+            followerFiber, followers[6], followerFiber, followers[7],
+            followerFiber, followers[8], followerFiber, followers[9], followerFiber, followers[10], followerFiber, followers[11]);
     auto expectedLog = std::vector{InternalLogEntry{std::tuple{'x', 1}, 1},
                                    InternalLogEntry{std::tuple{'y', 2}, 1} };
     boost::for_each(followers, [&expectedLog](auto &&follower){
@@ -300,5 +318,6 @@ static void oneLeaderOneFollowerScenarioWithConsensus() {
 
 int main() {
     oneLeaderOneFollowerScenarioWithConsensus();
+    oneLeaderManyFollowersScenarioWithConsensus();
     return 0;
 }
