@@ -295,7 +295,9 @@ public:
     channel& operator=(channel&&) noexcept = delete;
     channel() noexcept : reader_list{}, writer_list{} {}
 
-    ~channel() noexcept(false)
+    // noexcept(false) destructor is PITA - it's popagated to all users.
+    // Make it noexcept
+    ~channel()
     {
         fmt::print("{}\n", __PRETTY_FUNCTION__);
         writer_list& writers = *this;

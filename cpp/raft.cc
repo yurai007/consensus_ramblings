@@ -10,6 +10,7 @@
 #include <future>
 #include <stdexcept>
 #include <compare>
+#include <memory>
 
 struct Message {
     virtual ~Message() = default;
@@ -45,8 +46,8 @@ struct AppendEntriesResp final : Message {
     }
 };
 
-struct InternalLogEntry {
-    InternalLogEntry(const std::tuple<char, int> &_entry, int _term) noexcept
+struct MetaEntry {
+    MetaEntry(const std::tuple<char, int> &_entry, int _term) noexcept
         : entry(_entry), term(_term) {}
     std::tuple<char, int> entry;
     int term;
@@ -55,7 +56,7 @@ struct InternalLogEntry {
 class Node {
 public:
     virtual void run() = 0;
-    virtual ~Node() noexcept(false) {}
+    virtual ~Node() = default;
 
     void trackLog() const {
         if (debug) {
@@ -65,13 +66,14 @@ public:
 
 protected:
     std::map<char, int> logState;
-    std::vector<InternalLogEntry> log;
+    std::vector<MetaEntry> log;
     State state = State::INITIAL;
+public:
     int currentTerm = 0, commitIndex = 0, lastApplied = 0;
     constexpr static bool debug = false;
 };
 
-class Follower final : public Node {
+class Follower : public Node {
 public:
     void run() override {
         state = State::INITIAL;
@@ -125,8 +127,8 @@ public:
         fmt::print("Follower {}: done\n", me);
         trackLog();
     }
-    bool verifyLog(const std::vector<InternalLogEntry>&) const { return true; }
-    virtual ~Follower() noexcept(false) {}
+    bool verifyLog(const std::vector<MetaEntry>&) const { return true; }
+    virtual ~Follower() = default;
 private:
     channel<Message*> channelToLeader;
     std::unique_ptr<Message> msg;
@@ -141,8 +143,8 @@ private:
         }
     }
 
-    bool done(const HeartBeat &msg) const {
-        return msg.done;
+    bool done(const HeartBeat &_msg) const {
+        return _msg.done;
     }
 public:
     std::future<int> sendHeartbeat(bool done) {
@@ -184,11 +186,11 @@ public:
 
 class Leader final : public Node {
 public:
-    Leader(std::vector<Follower> &_followers, const std::map<char, int> &_entriesToReplicate) :
+    Leader(std::vector<std::shared_ptr<Follower>> &_followers, const std::map<char, int> &_entriesToReplicate) :
         followers(_followers),
         entriesToReplicate(_entriesToReplicate) {
         boost::for_each(followers, [this](auto &&follower){
-            nextIndex[&follower] = 0;
+            nextIndex[follower.get()] = 0;
         });
     }
 
@@ -199,12 +201,14 @@ public:
         boost::for_each(entriesToReplicate, [this](auto &entry){
             auto [id, value] = entry;
             boost::for_each(followers, [](auto &&follower){
-                follower.sendHeartbeat(false).get(); // FIXME: do in parallel + when_all helper
+                follower->sendHeartbeat(false).get(); // FIXME: do in parallel + when_all helper
             });
             lastApplied++;
             log.emplace_back(entry, currentTerm);
             // x = x, as workaround for http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2017/p0588r1.html
-            boost::for_each(followers, [this, entry = std::make_tuple(entry.first, entry.second), id = id, value = value, followerIsDone = false](auto &&it) mutable {
+            boost::for_each(followers, [this, entry = std::make_tuple(entry.first, entry.second), id = id, value = value, followerIsDone = false](auto &&follower) mutable {
+                 assert(follower != nullptr);
+                 auto &it = *follower;
                  do {
                     const auto logSize = static_cast<int>(log.size());
                     auto prevIndex = std::min(replicaNextIndex(&it) - 1, logSize - 1);
@@ -239,18 +243,22 @@ public:
             commitIndex++;
             logState[id] = value;
             boost::for_each(followers, [this](auto &&follower){
-                nextIndex[&follower] = replicaNextIndex(&follower) + 1;
+                nextIndex[follower.get()] = replicaNextIndex(follower.get()) + 1;
             });
             fmt::print("Leader: {} := {}\n", id, value);
          });
-        boost::for_each(followers, [this](auto &&it){
-            it.sendHeartbeat(true).get();
+        boost::for_each(followers, [this](auto &&follower){
+            follower->sendHeartbeat(true).get();
         });
         fmt::print("Leader: done\n");
     }
 
+    void replicateEntries(const std::map<char, int> &entriesToReplicate_) {
+        entriesToReplicate = entriesToReplicate_;
+    }
+
 private:
-     std::vector<Follower> &followers;
+     std::vector<std::shared_ptr<Follower>> &followers;
      std::map<Follower*, int> nextIndex, matchIndex;
      std::map<char, int> entriesToReplicate;
 
@@ -260,6 +268,18 @@ private:
      }
 };
 
+class ArtificialFollower : public Follower {
+public:
+    void poison(int term, const std::vector<MetaEntry> &_log) {
+        currentTerm = term;
+        log = _log;
+        logState.clear();
+        boost::for_each(log, [this](auto &&entry){
+            auto [e1, e2] = entry.entry;
+            logState[e1] = e2;
+        });
+    }
+};
 
 static void leaderFiber(Leader *leader) {
     auto task = [leader]() -> std::future<int> {
@@ -287,37 +307,114 @@ static void launchLeaderAndFollowers(Args&&... args) {
 }
 
 static void oneLeaderOneFollowerScenarioWithConsensus() {
-    auto followers = std::vector<Follower>(1u);
+    fmt::print("oneLeaderOneFollowerScenarioWithConsensus\n");
+    std::vector followers = {std::make_shared<Follower>()};
     auto entriesToReplicate = std::map<char, int> {{'x', 1},{'y', 2}};
     auto leader = Leader(followers, entriesToReplicate);
-    launchLeaderAndFollowers(leaderFiber, leader, followerFiber, followers[0]);
-    auto expectedLog = std::vector{InternalLogEntry{std::tuple{'x', 1}, 1},
-                                   InternalLogEntry{std::tuple{'y', 2}, 1} };
+    launchLeaderAndFollowers(leaderFiber, leader, followerFiber, *followers[0]);
+    auto expectedLog = {MetaEntry{std::tuple{'x', 1}, 1}, MetaEntry{std::tuple{'y', 2}, 1} };
     boost::for_each(followers, [&expectedLog](auto &&follower){
-        assert(follower.verifyLog(expectedLog));
+        assert(follower->verifyLog(expectedLog));
+        assert(follower->commitIndex == 2 && follower->currentTerm == 1);
     });
     fmt::print("\n");
 }
 
 static void oneLeaderManyFollowersScenarioWithConsensus() {
-    auto followers = std::vector<Follower>(12u);
+    fmt::print("oneLeaderManyFollowersScenarioWithConsensus\n");
+    auto followers = std::vector<std::shared_ptr<Follower>>(12u);
+    boost::for_each(followers, [](auto &follower){
+        follower = std::make_shared<Follower>();
+    });
+
     auto entriesToReplicate = std::map<char, int> {{'x', 1},{'y', 2}};
     auto leader = Leader(followers, entriesToReplicate);
     cooperative_scheduler::debug = false;
-    launchLeaderAndFollowers(leaderFiber, leader, followerFiber, followers[0], followerFiber, followers[1],
-            followerFiber, followers[2], followerFiber, followers[3], followerFiber, followers[4], followerFiber, followers[5],
-            followerFiber, followers[6], followerFiber, followers[7],
-            followerFiber, followers[8], followerFiber, followers[9], followerFiber, followers[10], followerFiber, followers[11]);
-    auto expectedLog = std::vector{InternalLogEntry{std::tuple{'x', 1}, 1},
-                                   InternalLogEntry{std::tuple{'y', 2}, 1} };
+    launchLeaderAndFollowers(leaderFiber, leader, followerFiber, *followers[0], followerFiber, *followers[1],
+            followerFiber, *followers[2], followerFiber, *followers[3], followerFiber, *followers[4], followerFiber, *followers[5],
+            followerFiber, *followers[6], followerFiber, *followers[7],
+            followerFiber, *followers[8], followerFiber, *followers[9], followerFiber, *followers[10], followerFiber, *followers[11]);
+    auto expectedLog = {MetaEntry{std::tuple{'x', 1}, 1}, MetaEntry{std::tuple{'y', 2}, 1} };
     boost::for_each(followers, [&expectedLog](auto &&follower){
-        assert(follower.verifyLog(expectedLog));
+        assert(follower->verifyLog(expectedLog));
+        assert(follower->commitIndex == 2 && follower->currentTerm == 1);
     });
     fmt::print("\n");
 }
 
+static void oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus() {
+    fmt::print("oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus\n");
+    auto entries1 = std::map<char, int> {{'a', 1}};
+    auto entries2 = std::map<char, int> {{'c', 3},{'d', 4}};
+    auto entries3 = std::map<char, int> {{'e', 5}};
+    //auto stopOnStateChange = true
+    auto afollower = std::make_shared<ArtificialFollower>();
+    auto followers = std::vector<std::shared_ptr<Follower>>{afollower};
+    auto leader = Leader(followers, entries1);
+    fmt::print("Term 1 - replicate entries1\n");
+    launchLeaderAndFollowers(leaderFiber, leader, followerFiber, *followers[0]);
+
+    leader.replicateEntries({});
+    fmt::print("Term 2 - just bump Leader term\n");
+    launchLeaderAndFollowers(leaderFiber, leader, followerFiber, *followers[0]);
+
+    leader.replicateEntries(entries2);
+    fmt::print("Term 3 - replicate entries2\n");
+    launchLeaderAndFollowers(leaderFiber, leader, followerFiber, *followers[0]);
+
+    afollower->poison(2, {MetaEntry{std::tuple{'a', 1}, 1}, MetaEntry{std::tuple{'z', 3}, 2} });
+    leader.replicateEntries(entries3);
+    fmt::print("Term 4 - replicate entries3; follower log is going to be aligned\n");
+    launchLeaderAndFollowers(leaderFiber, leader, followerFiber, *followers[0]);
+
+    auto expectedLog = {MetaEntry{std::tuple{'a', 1}, 1}, MetaEntry{std::tuple{'d', 4}, 3},
+         MetaEntry{std::tuple{'c', 3}, 3}, MetaEntry{std::tuple{'e', 5}, 4}};
+    boost::for_each(followers, [&expectedLog](auto &&follower){
+        assert(follower->verifyLog(expectedLog));
+        assert(follower->commitIndex == 4 && follower->currentTerm == 4);
+    });
+}
+
+static void oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithConsensus() {
+     fmt::print("oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithConsensus\n");
+     auto entries1 = std::map<char, int> {{'a', 1}};
+     auto entries2 = std::map<char, int> {{'c', 3},{'d', 4}};
+     auto entries3 = std::map<char, int> {{'e', 5}};
+     auto afollower = std::make_shared<ArtificialFollower>();
+     auto followers = std::vector<std::shared_ptr<Follower>>{afollower};
+     auto leader = Leader(followers, entries1);
+     fmt::print("Term 1 - replicate entries1\n");
+     launchLeaderAndFollowers(leaderFiber, leader, followerFiber, *followers[0]);
+
+     leader.replicateEntries({});
+     fmt::print("Term 2 & 3 - just bump Leader term\n");
+     launchLeaderAndFollowers(leaderFiber, leader, followerFiber, *followers[0]);
+     leader.replicateEntries({});
+     launchLeaderAndFollowers(leaderFiber, leader, followerFiber, *followers[0]);
+
+     leader.replicateEntries(entries2);
+     fmt::print("Term 4 - replicate entries2");
+     launchLeaderAndFollowers(leaderFiber, leader, followerFiber, *followers[0]);
+
+     afollower->poison(4, {MetaEntry{std::tuple{'a', 1}, 1}, MetaEntry{std::tuple{'b', 1}, 1},
+                        MetaEntry{std::tuple{'x', 2}, 2}, MetaEntry{std::tuple{'z', 2}, 2}, MetaEntry{std::tuple{'p', 3}, 3},
+                        MetaEntry{std::tuple{'q', 3}, 3}, MetaEntry{std::tuple{'c', 3}, 4}, MetaEntry{std::tuple{'d', 4}, 4}});
+     leader.replicateEntries(entries3);
+     fmt::print("Term 5 - replicate entries3; follower log is going to be aligned");
+     launchLeaderAndFollowers(leaderFiber, leader, followerFiber, *followers[0]);
+
+     auto expectedLog = {MetaEntry{std::tuple{'a', 1}, 1}, MetaEntry{std::tuple{'d', 4}, 4},
+          MetaEntry{std::tuple{'c', 3}, 4}, MetaEntry{std::tuple{'e', 5}, 5}};
+     boost::for_each(followers, [&expectedLog](auto &&follower){
+         assert(follower->verifyLog(expectedLog));
+         assert(follower->commitIndex == 4 && follower->currentTerm == 5);
+     });
+ }
+
 int main() {
     oneLeaderOneFollowerScenarioWithConsensus();
     oneLeaderManyFollowersScenarioWithConsensus();
+    oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus();
+    oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithConsensus();
     return 0;
 }
