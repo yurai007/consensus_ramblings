@@ -27,10 +27,18 @@ struct HeartBeat final : Message {
     bool done = false;
 };
 
-struct AppendEntriesReq final : Message {
-    AppendEntriesReq(const std::tuple<char, int> &_entry, int _term, int _prevIndex, int _prevTerm, int _leaderCommit) noexcept
-        : entry(_entry), term(_term), prevIndex(_prevIndex), prevTerm(_prevTerm), leaderCommit(_leaderCommit) {}
+struct MetaEntry {
+    MetaEntry(const std::tuple<char, int> &_entry, int _term) noexcept
+        : entry(_entry), term(_term) {}
     std::tuple<char, int> entry;
+    int term;
+};
+
+struct AppendEntriesReq final : Message {
+    AppendEntriesReq(const MetaEntry &_metaEntry, int _term, int _prevIndex, int _prevTerm, int _leaderCommit) noexcept
+        : metaEntry(_metaEntry), term(_term), prevIndex(_prevIndex), prevTerm(_prevTerm), leaderCommit(_leaderCommit) {}
+
+    MetaEntry metaEntry;
     int term, prevIndex, prevTerm, leaderCommit;
 };
 
@@ -46,12 +54,7 @@ struct AppendEntriesResp final : Message {
     }
 };
 
-struct MetaEntry {
-    MetaEntry(const std::tuple<char, int> &_entry, int _term) noexcept
-        : entry(_entry), term(_term) {}
-    std::tuple<char, int> entry;
-    int term;
-};
+
 
 class Node {
 public:
@@ -60,7 +63,10 @@ public:
 
     void trackLog() const {
         if (debug) {
-            throw std::logic_error("Unimplemented yet");
+            for (auto &&item : log) {
+                fmt::print("{} {} {}  ", item.term, std::get<0>(item.entry), std::get<1>(item.entry));
+            }
+            fmt::print("\n");
         }
     }
 
@@ -70,7 +76,7 @@ protected:
     State state = State::INITIAL;
 public:
     int currentTerm = 0, commitIndex = 0, lastApplied = 0;
-    constexpr static bool debug = false;
+    constexpr static bool debug = true;
 };
 
 class Follower : public Node {
@@ -87,37 +93,43 @@ public:
             auto apply = true;
             auto prevIndex = appendEntries->prevIndex;
             auto prevTerm = appendEntries->prevTerm;
-            if (prevIndex >= 0) {
-                if (prevIndex < logSize) {
-                    // [2]
-                    if (log[prevIndex].term != prevTerm) {
+            // [1]
+            if (appendEntries->term < currentTerm) {
+                apply = false;
+            } else {
+                // [1]
+                if (appendEntries->term > currentTerm) {
+                   currentTerm = appendEntries->term;
+                }
+                if (prevIndex >= 0) {
+                    if (prevIndex < log.size()) { // WTF, logSize is wrong (0) but log.size() ok?
+                        // [2]
+                        if (log[prevIndex].term != prevTerm) {
+                            apply = false;
+                        }
+                    } else {
                         apply = false;
                     }
-                } else {
-                    apply = false;
-                }
-                if (prevIndex + 1 < logSize) {
-                    // [3]
-                    if (log[prevIndex + 1].term != appendEntries->term) {
-                        // cleanup because of inconsistency, leave only log[0..prevIndex] prefix,
-                        // with assumption that prefix is valid we can append entry in this iteration
-                        shrinkUntil(prevIndex);
+                    if (prevIndex + 1 < log.size()) {
+                        // [3]
+                        if (log[prevIndex + 1].term != appendEntries->metaEntry.term) {
+                            // cleanup because of inconsistency, leave only log[0..prevIndex] prefix,
+                            // with assumption that prefix is valid we can append entry in this iteration
+                            shrinkUntil(prevIndex);
+                        }
                     }
                 }
             }
             auto appendEntries_cp = std::make_unique<AppendEntriesReq>(*appendEntries);
             // at this point previous msg from channel ends lifetime so we need copy it
-            sendAppendEntriesResp(AppendEntriesResp(appendEntries->term, apply)).get();
-            auto [id, value] = appendEntries_cp->entry;
+            sendAppendEntriesResp(AppendEntriesResp(currentTerm, apply)).get();
+            auto [id, value] = appendEntries_cp->metaEntry.entry;
             if (apply) {
-                log.emplace_back(appendEntries_cp->entry, appendEntries_cp->term);
+                log.emplace_back(appendEntries_cp->metaEntry.entry, appendEntries_cp->term);
                 logState[id] = value;
                 fmt::print("Follower {}: {} := {}\n", me, id, value);
                 commitIndex++;
                 lastApplied++;
-                if (appendEntries_cp->term > currentTerm) {
-                    currentTerm = appendEntries_cp->term;
-                }
             } else {
                 fmt::print("Follower {}: no consensus for {}\n", me, id);
                 trackLog();
@@ -139,8 +151,8 @@ private:
             auto &&[keyValue, _] = log[i];
             auto &&[key, __] = keyValue;
             logState.erase(key);
-            // log.removeAt(i); FIXME
         }
+        log.erase(log.begin() + index + 1, log.end());
     }
 
     bool done(const HeartBeat &_msg) const {
@@ -200,44 +212,46 @@ public:
         fmt::print("Leader of term {}\n", currentTerm);
         boost::for_each(entriesToReplicate, [this](auto &entry){
             auto [id, value] = entry;
+
             boost::for_each(followers, [](auto &&follower){
                 follower->sendHeartbeat(false).get(); // FIXME: do in parallel + when_all helper
             });
             lastApplied++;
             log.emplace_back(entry, currentTerm);
             // x = x, as workaround for http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2017/p0588r1.html
-            boost::for_each(followers, [this, entry = std::make_tuple(entry.first, entry.second), id = id, value = value, followerIsDone = false](auto &&follower) mutable {
+            boost::for_each(followers, [this, metaEntry = MetaEntry{entry, currentTerm}, followerIsDone = false](auto &&follower) mutable {
                  assert(follower != nullptr);
                  auto &it = *follower;
                  do {
+                    auto [id, value] = metaEntry.entry;
                     const auto logSize = static_cast<int>(log.size());
                     auto prevIndex = std::min(replicaNextIndex(&it) - 1, logSize - 1);
                     auto prevTerm = (prevIndex >= 0)? log[prevIndex].term  : 0;
-                    auto term =  (prevIndex + 1 >= 0 && prevIndex + 1 < logSize) ? log[prevIndex + 1].term  : currentTerm;
-                    it.sendAppendEntriesReq(AppendEntriesReq(entry, term, prevIndex, prevTerm, commitIndex)).get();
+                    it.sendAppendEntriesReq(AppendEntriesReq(metaEntry, currentTerm, prevIndex, prevTerm, commitIndex)).get();
                     auto response = *it.receiveAppendEntriesResp().get();
-                    auto expected = AppendEntriesResp(term, true);
+                    auto expected = AppendEntriesResp(currentTerm, true);
 
-                     if (response <=> expected != 0) {
+                    if (response <=> expected != 0) {
                         fmt::print("Leader: No consensus for {} {}\n", id, value);
+                        // [5.3]
                         nextIndex[&it] = replicaNextIndex(&it) - 1;
                         if (replicaNextIndex(&it) >= 0) {
-                            entry = log[replicaNextIndex(&it)].entry;
+                            metaEntry = log[replicaNextIndex(&it)];
                         }
                         it.sendHeartbeat(false).get();
                         trackLog();
-                    } else if (term == currentTerm) {
+                    } else if (replicaNextIndex(&it) == logSize - 1) {
                         followerIsDone = true;
                     } else {
                         nextIndex[&it] = replicaNextIndex(&it) + 1;
                         if (replicaNextIndex(&it) < logSize) {
-                            entry = log[replicaNextIndex(&it)].entry;
+                            metaEntry = log[replicaNextIndex(&it)];
                         } else {
-                            entry = std::tie(id, value);
+                            metaEntry = {std::tie(id, value), currentTerm};
                         }
                         it.sendHeartbeat(false).get();
                     }
-
+                    fmt::print("Leader: follower is done: {}\n", followerIsDone);
                  } while (!followerIsDone);
             });
             commitIndex++;
@@ -264,7 +278,7 @@ private:
 
      int replicaNextIndex(Follower *follower) const {
          auto it = nextIndex.find(follower);
-         return (it != nextIndex.end())? *it : throw std::logic_error("Shouldn't happen"), 0;
+         return (it != nextIndex.end())? it->second : (throw std::logic_error("Shouldn't happen"), 42);
      }
 };
 
