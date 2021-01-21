@@ -1,7 +1,10 @@
 ﻿#include "cooperative_scheduler.hh"
 #include "channel.hh"
+#include <boost/range/algorithm.hpp>
 #include <boost/range/algorithm/for_each.hpp>
 #include <boost/range/irange.hpp>
+#include <boost/range/adaptor/map.hpp>
+#include <boost/range/algorithm/copy.hpp>
 #include <fmt/core.h>
 #include <tuple>
 #include <map>
@@ -54,8 +57,6 @@ struct AppendEntriesResp final : Message {
     }
 };
 
-
-
 class Node {
 public:
     virtual void run() = 0;
@@ -64,7 +65,7 @@ public:
     void trackLog() const {
         if (debug) {
             for (auto &&item : log) {
-                fmt::print("{} {} {}  ", item.term, std::get<0>(item.entry), std::get<1>(item.entry));
+                fmt::print("({}, {}) {}  ", item.term, std::get<0>(item.entry), std::get<1>(item.entry));
             }
             fmt::print("\n");
         }
@@ -85,7 +86,7 @@ public:
         state = State::INITIAL;
         currentTerm++;
         const auto logSize = static_cast<int>(log.size());
-        commitIndex = std::max(logSize - 1, 0);
+        commitIndex = std::max(logSize, 0);
         const void *me = this;
         fmt::print("Follower {}: starts\n", me);
         while (!done(*receiveHeartbeat().get())) {
@@ -124,19 +125,22 @@ public:
             // at this point previous msg from channel ends lifetime so we need copy it
             sendAppendEntriesResp(AppendEntriesResp(currentTerm, apply)).get();
             auto [id, value] = appendEntries_cp->metaEntry.entry;
+            auto leaderCommit = appendEntries_cp->leaderCommit;
             if (apply) {
-                log.emplace_back(appendEntries_cp->metaEntry.entry, appendEntries_cp->term);
+                // [4]
+                log.emplace_back(appendEntries_cp->metaEntry.entry, appendEntries_cp->metaEntry.term);
                 logState[id] = value;
-                fmt::print("Follower {}: {} := {}\n", me, id, value);
-                commitIndex++;
                 lastApplied++;
+                fmt::print("Follower {}: {} := {}\n", me, id, value);
+                // [5]
+                commitIndex = std::min(leaderCommit + 1, commitIndex + 1);
             } else {
                 fmt::print("Follower {}: no consensus for {}\n", me, id);
                 trackLog();
             }
         }
         state = State::DONE;
-        fmt::print("Follower {}: done\n", me);
+        fmt::print("Follower {}: done with commitIndex = {}\n", me, commitIndex);
         trackLog();
     }
     bool verifyLog(const std::vector<MetaEntry>&) const { return true; }
@@ -251,14 +255,21 @@ public:
                         }
                         it.sendHeartbeat(false).get();
                     }
-                    fmt::print("Leader: follower is done: {}\n", followerIsDone);
                  } while (!followerIsDone);
             });
-            commitIndex++;
             logState[id] = value;
+            // [5.3]
             boost::for_each(followers, [this](auto &&follower){
-                nextIndex[follower.get()] = replicaNextIndex(follower.get()) + 1;
+                auto it = follower.get();
+                matchIndex[it] = replicaNextIndex(it);
+                nextIndex[it] = replicaNextIndex(it) + 1;
             });
+            // [5.3] [5.4]
+            using namespace boost::adaptors;
+            auto indexList =  boost::copy_range<std::vector<int>>(matchIndex | map_values);
+            boost::range::sort(indexList);
+            auto majorityCommitIndex = (log[indexList[indexList.size()/2]].term == currentTerm)? indexList[indexList.size()/2] :0;
+            commitIndex = std::max(majorityCommitIndex, commitIndex + 1);
             fmt::print("Leader: {} := {}\n", id, value);
          });
         boost::for_each(followers, [this](auto &&follower){

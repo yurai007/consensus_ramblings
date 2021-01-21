@@ -59,6 +59,8 @@ static inline void* poison() noexcept {
     return reinterpret_cast<void*>(0xFADE'038C'BCFA'9E64);
 }
 
+constexpr bool debug = false;
+
 template <typename T>
 class list {
 public:
@@ -142,7 +144,9 @@ public:
 
 public:
     bool await_ready() const  {
-        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        if (debug) {
+            fmt::print("{}\n", __PRETTY_FUNCTION__);
+        }
         if (channel_->writer_list::is_empty()) {
             return false;
         }
@@ -153,7 +157,9 @@ public:
         return true;
     }
     void await_suspend(stdx::coroutine_handle<> coro) {
-        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        if (debug) {
+            fmt::print("{}\n", __PRETTY_FUNCTION__);
+        }
         // notice that next & chan are sharing memory
         auto& ch = *(this->channel_);
         frame = coro.address(); // remember handle before push/unlock
@@ -164,7 +170,9 @@ public:
     std::tuple<value_type, bool> await_resume() {
         // WTF??
         // fmt::print("{} {}\n", __PRETTY_FUNCTION__);
-        fmt::print("{}", __PRETTY_FUNCTION__);
+        if (debug) {
+            fmt::print("{}", __PRETTY_FUNCTION__);
+        }
         auto t = std::make_tuple(value_type{}, false);
         // frame holds poision if the channel is going to be destroyed
         if (frame == poison())
@@ -174,10 +182,12 @@ public:
         // can destroy the writer coroutine
         auto& value = std::get<0>(t);
         value = std::move(*value_ptr);
-        if constexpr(std::is_pointer<T>::value) {
-            fmt::print(" T = {}\n", typeid(*value).name());
-        } else {
-            fmt::print("\n");
+        if (debug) {
+            if constexpr(std::is_pointer<T>::value) {
+                fmt::print(" T = {}\n", typeid(*value).name());
+            } else {
+                fmt::print("\n");
+            }
         }
         if (auto coro = stdx::coroutine_handle<>::from_address(frame))
             coro.resume();
@@ -235,7 +245,9 @@ public:
 
 public:
     bool await_ready() const {
-        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        if (debug) {
+            fmt::print("{}\n", __PRETTY_FUNCTION__);
+        }
         if (channel_->reader_list::is_empty()) {
             return false;
         }
@@ -246,7 +258,9 @@ public:
         return true;
     }
     void await_suspend(stdx::coroutine_handle<> coro) {
-        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        if (debug) {
+            fmt::print("{}\n", __PRETTY_FUNCTION__);
+        }
         // notice that next & chan are sharing memory
         auto& ch = *(this->channel_);
 
@@ -256,14 +270,15 @@ public:
         ch.writer_list::push(this);
     }
     bool await_resume() {
-        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        if (debug) {
+            fmt::print("{}\n", __PRETTY_FUNCTION__);
+        }
         // frame holds poision if the channel is going to destroy
         if (frame == poison()) {
             fmt::print("poison\n");
             return false;
         }
         if (auto coro = stdx::coroutine_handle<>::from_address(frame)) {
-            fmt::print("coro.resume\n");
             coro.resume();
         }
 
@@ -299,7 +314,9 @@ public:
     // Make it noexcept
     ~channel()
     {
-        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        if (debug) {
+            fmt::print("{}\n", __PRETTY_FUNCTION__);
+        }
         writer_list& writers = *this;
         reader_list& readers = *this;
         //
