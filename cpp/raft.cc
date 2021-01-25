@@ -39,10 +39,9 @@ struct MetaEntry {
         : entry(_entry), term(_term) {}
     std::tuple<char, int> entry;
     int term;
-    // a little bit more general but still cool
-    auto operator<=>(const MetaEntry& rhs) const noexcept {
-        auto first = term <=> rhs.term;
-        return (first != 0)? first : std::get<0>(entry) <=> std::get<0>(rhs.entry);
+    bool operator==(const MetaEntry& rhs) const noexcept {
+        auto first = term == rhs.term;
+        return first? (entry == rhs.entry) : false;
     }
 };
 
@@ -81,6 +80,13 @@ struct RequestVoteResp final : Message {
     bool voteGranted;
 };
 
+static void printLog(const std::vector<MetaEntry> &log) {
+    for (auto &&item : log) {
+        fmt::print("({}, {}) {}  ", item.term, std::get<0>(item.entry), std::get<1>(item.entry));
+    }
+    fmt::print("\n");
+}
+
 class Node {
 public:
     Node() = default;
@@ -94,11 +100,12 @@ public:
 
     void trackLog() const {
         if (debug) {
-            for (auto &&item : log) {
-                fmt::print("({}, {}) {}  ", item.term, std::get<0>(item.entry), std::get<1>(item.entry));
-            }
-            fmt::print("\n");
+            printLog(log);
         }
+    }
+
+    bool verifyLog(const std::vector<MetaEntry> &expectedLog) const {
+        return expectedLog == log;
     }
 
 protected:
@@ -191,10 +198,6 @@ public:
             fmt::print("Follower {}: Heartbeat or AppendEntriesReq failed with election timeout. Start election.", me);
         }
     }
-
-    bool verifyLog(const std::vector<MetaEntry> &expectedLog) const {
-        return expectedLog == log;
-    }
     virtual ~Follower() = default;
 private:
 #ifndef __clang__
@@ -275,7 +278,7 @@ public:
         currentTerm++;
         fmt::print("Leader of term {}\n", currentTerm);
         boost::for_each(entriesToReplicate, [this](auto &entry){
-            auto [id, value] = entry;
+            auto [id, entry_value] = entry;
 
             boost::for_each(followers, [this](auto &&follower){
                 // FIXME: do in parallel + when_all helper
@@ -300,7 +303,7 @@ public:
                             commitIndex)).get();
                     auto maybeResponse = it.receiveAppendEntriesResp().get();
                     if (maybeResponse == nullptr){
-                        fmt::print("Leader: No AppendEntriesResp from {}. Should try again later\n", it);
+                        fmt::print("Leader: No AppendEntriesResp from {}. Should try again later\n", static_cast<void*>(&it));
                         break;
                     }
                     auto response = *maybeResponse;
@@ -334,7 +337,7 @@ public:
                     }
                  } while (!followerIsDone);
             });
-            logState[id] = value;
+            logState[id] = entry_value;
             // [5.3]
             boost::for_each(followers, [this](auto &&it){
                 matchIndex[it] = replicaNextIndex(it);
@@ -347,7 +350,7 @@ public:
             auto majorityCommitIndex = (log[indexList[indexList.size()/2]].term == currentTerm)?
                         indexList[indexList.size()/2] :0;
             commitIndex = std::max(majorityCommitIndex, commitIndex + 1);
-            fmt::print("Leader: {} := {}\n", id, value);
+            fmt::print("Leader: {} := {}\n", id, entry_value);
          });
         boost::for_each(followers, [](auto &&follower){
             follower->sendHeartbeat(true).get();
@@ -421,7 +424,7 @@ public:
                            vote = false;
                        }
                        if (vote) {
-                           fmt::print("Candidate {}: vote for {} + transition to Follower\n", me, voter);
+                           fmt::print("Candidate {}: vote for {} + transition to Follower\n", me, static_cast<void*>(voter));
                            sendRequestVoteResp(*voter, RequestVoteResp(currentTerm, true)).get();
                            endOfElection = true;
                            state = State::FOLLOWER;
@@ -618,7 +621,7 @@ static void serversFiber(std::vector<std::unique_ptr<Node>> *servers) {
             boost::for_each(*servers, [](auto &&node){
                 try {
                     node->run();
-                } catch (...) {  fmt::print("Server {}: failed\n", node.get()); }
+                } catch (...) {  fmt::print("Server {}: failed\n", static_cast<void*>(node.get())); }
             });
          co_return 0;
     };
@@ -629,7 +632,7 @@ static void serverFiber(Node *server) {
     auto task = [server]() -> std::future<int> {
          try {
              server->run();
-         } catch (...) {  fmt::print("Server {}: failed\n", server); }
+         } catch (...) {  fmt::print("Server {}: failed\n", static_cast<void*>(server)); }
          co_return 0;
     };
     task().get();
@@ -649,10 +652,9 @@ static void oneLeaderOneFollowerScenarioWithConsensus() {
     launchServers(serverFiber, *nodes[0], serverFiber, *nodes[1]);
     auto expectedLog = {MetaEntry{std::tuple{'x', 1}, 1}, MetaEntry{std::tuple{'y', 2}, 1} };
     boost::for_each(nodes, [&expectedLog](auto &&server){
-        if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-            assert(follower->verifyLog(expectedLog));
-            assert(follower->commitIndex == 2 && follower->currentTerm == 1);
-        }
+        auto node = server->me();
+        assert(node->verifyLog(expectedLog));
+        assert(node->commitIndex == 2 && node->currentTerm == 1);
     });
     fmt::print("\n");
 }
@@ -668,10 +670,9 @@ static void oneLeaderOneFollowerMoreEntriesScenarioWithConsensus() {
                         MetaEntry{std::tuple{'3', 3}, 1}, MetaEntry{std::tuple{'4', 2}, 1},
                         MetaEntry{std::tuple{'5', 1}, 1}, MetaEntry{std::tuple{'6', 3}, 1}};
     boost::for_each(nodes, [&expectedLog](auto &&server){
-        if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-            assert(follower->verifyLog(expectedLog));
-            assert(follower->commitIndex == 6 && follower->currentTerm == 1);
-        }
+        auto node = server->me();
+        assert(node->verifyLog(expectedLog));
+        assert(node->commitIndex == 6 && node->currentTerm == 1);
     });
     fmt::print("\n");
 }
@@ -685,16 +686,15 @@ static void oneLeaderManyFollowersScenarioWithConsensus() {
     auto entriesToReplicate = std::map<char, int> {{'x', 1},{'y', 2}};
     nodes.push_back(std::make_unique<Server>(Instance::LEADER, entriesToReplicate, nodes, false));
     cooperative_scheduler::debug = false;
-    launchServers(serverFiber, nodes.back(), serverFiber, *nodes[0], serverFiber, *nodes[1],
+    launchServers(serverFiber, *nodes.back(), serverFiber, *nodes[0], serverFiber, *nodes[1],
             serverFiber, *nodes[2], serverFiber, *nodes[3], serverFiber, *nodes[4], serverFiber,
             *nodes[5], serverFiber, *nodes[6], serverFiber, *nodes[7], serverFiber, *nodes[8],
             serverFiber, *nodes[9], serverFiber, *nodes[10], serverFiber, *nodes[11]);
     auto expectedLog = {MetaEntry{std::tuple{'x', 1}, 1}, MetaEntry{std::tuple{'y', 2}, 1} };
     boost::for_each(nodes, [&expectedLog](auto &&server){
-        if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-            assert(follower->verifyLog(expectedLog));
-            assert(follower->commitIndex == 2 && follower->currentTerm == 1);
-        }
+        auto node = server->me();
+        assert(node->verifyLog(expectedLog));
+        assert(node->commitIndex == 2 && node->currentTerm == 1);
     });
     fmt::print("\n");
 }
@@ -708,15 +708,13 @@ static void oneLeaderManyFollowersWithArtificialOneScenarioWithConsensus() {
     }
     nodes.push_back(std::make_unique<Server>(Instance::ARTIFICIAL_FOLLOWER, std::nullopt, nodes, false));
     nodes.push_back(std::make_unique<Server>(Instance::LEADER, entriesToReplicate, nodes, false));
-    launchServers(serverFiber, nodes.back(), serverFiber, *nodes[0], serverFiber, *nodes[1],
+    launchServers(serverFiber, *nodes.back(), serverFiber, *nodes[0], serverFiber, *nodes[1],
             serverFiber, *nodes[2], serverFiber, *nodes[3], serverFiber, *nodes[4]);
     auto expectedLog = {MetaEntry{std::tuple{'x', 1}, 1}, MetaEntry{std::tuple{'y', 2}, 1} };
     boost::for_each(nodes, [&expectedLog](auto &&server){
-        // TODO: What about artificial one?
-        if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-            assert(follower->verifyLog(expectedLog));
-            assert(follower->commitIndex == 2 && follower->currentTerm == 1);
-        }
+        auto node = server->me();
+        assert(node->verifyLog(expectedLog));
+        assert(node->commitIndex == 2 && node->currentTerm == 1);
     });
     fmt::print("\n");
 }
@@ -737,11 +735,9 @@ static void oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus() {
     auto expectedLog = {MetaEntry{std::tuple{'a', 1}, 1}, MetaEntry{std::tuple{'b', 2}, 1},
                        MetaEntry{std::tuple{'d', 4}, 2}, MetaEntry{std::tuple{'c', 3}, 2}};
     boost::for_each(nodes, [&expectedLog](auto &&server){
-        // TODO: What about artificial one?
-        if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-            assert(follower->verifyLog(expectedLog));
-            assert(follower->commitIndex == 4 && follower->currentTerm == 2);
-        }
+        auto node = server->me();
+        assert(node->verifyLog(expectedLog));
+        assert(node->commitIndex == 4 && node->currentTerm == 2);
     });
     fmt::print("\n");
 }
@@ -773,11 +769,9 @@ static void oneLeaderOneFollowerShouldCatchUpWithConsensus() {
                        MetaEntry{std::tuple{'e', 5}, 3}};
 
     boost::for_each(nodes, [&expectedLog](auto &&server){
-        // TODO: What about artificial one?
-        if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-            assert(follower->verifyLog(expectedLog));
-            assert(follower->commitIndex == 5 && follower->currentTerm == 3);
-        }
+        auto node = server->me();
+        assert(node->verifyLog(expectedLog));
+        assert(node->commitIndex == 5 && node->currentTerm == 3);
     });
     fmt::print("\n");
 }
@@ -812,11 +806,9 @@ static void oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus() 
     auto expectedLog = {MetaEntry{std::tuple{'a', 1}, 1}, MetaEntry{std::tuple{'d', 4}, 3},
          MetaEntry{std::tuple{'c', 3}, 3}, MetaEntry{std::tuple{'e', 5}, 4}};
     boost::for_each(nodes, [&expectedLog](auto &&server){
-        // TODO: What about artificial one?
-        if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-            assert(follower->verifyLog(expectedLog));
-            assert(follower->commitIndex == 4 && follower->currentTerm == 4);
-        }
+        auto node = server->me();
+        assert(node->verifyLog(expectedLog));
+        assert(node->commitIndex == 4 && node->currentTerm == 4);
     });
     fmt::print("\n");
 }
@@ -856,11 +848,9 @@ static void oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithCon
     auto expectedLog = {MetaEntry{std::tuple{'a', 1}, 1}, MetaEntry{std::tuple{'d', 4}, 4},
          MetaEntry{std::tuple{'c', 3}, 4}, MetaEntry{std::tuple{'e', 5}, 5}};
     boost::for_each(nodes, [&expectedLog](auto &&server){
-        // TODO: What about artificial one?
-        if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-            assert(follower->verifyLog(expectedLog));
-            assert(follower->commitIndex == 4 && follower->currentTerm == 5);
-        }
+        auto node = server->me();
+        assert(node->verifyLog(expectedLog));
+        assert(node->commitIndex == 4 && node->currentTerm == 5);
     });
     fmt::print("\n");
 }
@@ -899,17 +889,11 @@ static void oneFailingLeaderOneFollowerScenarioWithConsensus() {
     assert(leader->state == State::CANDIDATE && follower->state == State::CANDIDATE);
     fmt::print("Term 2 - one wins elections and replicate entries\n");
     launchServers(serverFiber, *nodes[0], serverFiber, *nodes[1]);
-
     boost::for_each(nodes, [](auto &&server){
-       if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-           assert(follower->verifyLog({MetaEntry{std::tuple{'x', 1}, 1}, MetaEntry{std::tuple{'y', 2}, 1}}));
-           assert(follower->commitIndex == 2 && follower->currentTerm == 1);
-           assert(follower->state == State::DONE);
-       } else if (auto leader = dynamic_cast<Leader*>(server->me()); leader != nullptr) {
-            assert(leader->state == State::DONE);
-       } else {
-           assert(false);
-       }
+        auto node = server->me();
+        assert(node->verifyLog({MetaEntry{std::tuple{'x', 1}, 1}, MetaEntry{std::tuple{'y', 2}, 1}}));
+        assert(node->commitIndex == 2 && node->currentTerm == 1);
+        assert(node->state == State::DONE);
     });
     fmt::print("\n");
 }
@@ -937,13 +921,8 @@ static void moreCandidatesInitiateElectionsOneWins() {
     launchServers(serverFiber, *nodes[0], serverFiber, *nodes[1],
             serverFiber, *nodes[2], serverFiber, *nodes[3], serverFiber, *nodes[4]);
     boost::for_each(nodes, [](auto &&server){
-       if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-           assert(follower->state == State::DONE);
-       } else if (auto leader = dynamic_cast<Leader*>(server->me()); leader != nullptr) {
-            assert(leader->state == State::DONE);
-       } else {
-           assert(false);
-       }
+        auto node = server->me();
+        assert(node->state == State::DONE);
     });
     fmt::print("\n");
 }
@@ -956,21 +935,13 @@ static void twoCandidatesInitiateElectionsOneWinsWithConsensus() {
     nodes.push_back(std::make_unique<Server>(Instance::FOLLOWER, entriesToReplicate, nodes, false));
     fmt::print("All servers become candidates, one wins elections and replicate entries\n");
     launchServers(serverFiber, *nodes[0], serverFiber, *nodes[1]);
-    auto follower1 = dynamic_cast<Follower*>(nodes.front()->me());
-    auto follower2 = dynamic_cast<Follower*>(nodes.back()->me());
-    assert(follower1->state == State::DONE && follower2->state == State::DONE);
     boost::for_each(nodes, [](auto &&server){
-       if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-           assert(follower->verifyLog({MetaEntry{std::tuple{'1', 1}, 1}, MetaEntry{std::tuple{'2', 2}, 1},
-                                      MetaEntry{std::tuple{'3', 3}, 1}, MetaEntry{std::tuple{'4', 4}, 1},
-                                      MetaEntry{std::tuple{'5', 5}, 1}, MetaEntry{std::tuple{'6', 6}, 1}}));
-           assert(follower->commitIndex == 6 && follower->currentTerm == 1);
-           assert(follower->state == State::DONE);
-       } else if (auto leader = dynamic_cast<Leader*>(server->me()); leader != nullptr) {
-            assert(leader->state == State::DONE);
-       } else {
-           assert(false);
-       }
+        auto node = server->me();
+        assert(node->verifyLog({MetaEntry{std::tuple{'1', 1}, 1}, MetaEntry{std::tuple{'2', 2}, 1},
+                                MetaEntry{std::tuple{'3', 3}, 1}, MetaEntry{std::tuple{'4', 4}, 1},
+                                MetaEntry{std::tuple{'5', 5}, 1}, MetaEntry{std::tuple{'6', 6}, 1}}));
+        assert(node->commitIndex == 6 && node->currentTerm == 1);
+        assert(node->state == State::DONE);
     });
     fmt::print("\n");
 }
@@ -985,17 +956,12 @@ static void moreCandidatesInitiateElectionsOneWinsWithConsensus() {
     fmt::print("All servers become candidates, one wins elections and replicate entries\n");
     launchServers(serverFiber, *nodes[0], serverFiber, *nodes[1]);
     boost::for_each(nodes, [](auto &&server){
-       if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-           assert(follower->verifyLog({MetaEntry{std::tuple{'1', 1}, 1}, MetaEntry{std::tuple{'2', 2}, 1},
-                                      MetaEntry{std::tuple{'3', 3}, 1}, MetaEntry{std::tuple{'4', 4}, 1},
-                                      MetaEntry{std::tuple{'5', 5}, 1}, MetaEntry{std::tuple{'6', 6}, 1}}));
-           assert(follower->commitIndex == 6 && follower->currentTerm == 1);
-           assert(follower->state == State::DONE);
-       } else if (auto leader = dynamic_cast<Leader*>(server->me()); leader != nullptr) {
-            assert(leader->state == State::DONE);
-       } else {
-           assert(false);
-       }
+        auto node = server->me();
+        assert(node->verifyLog({MetaEntry{std::tuple{'1', 1}, 1}, MetaEntry{std::tuple{'2', 2}, 1},
+                                MetaEntry{std::tuple{'3', 3}, 1}, MetaEntry{std::tuple{'4', 4}, 1},
+                                MetaEntry{std::tuple{'5', 5}, 1}, MetaEntry{std::tuple{'6', 6}, 1}}));
+        assert(node->commitIndex == 6 && node->currentTerm == 1);
+        assert(node->state == State::DONE);
     });
     fmt::print("\n");
 }
@@ -1014,7 +980,9 @@ static std::vector<MetaEntry> generateRandomLog(unsigned size, int maxTerm)  {
         auto i = getRandom(1, maxTerm);
         randomLog.push_back(MetaEntry{std::tuple{'a', i}, i});
     }
+#if 0 // FIXME
     boost::sort(randomLog);
+#endif
     return randomLog;
 }
 
@@ -1022,9 +990,8 @@ static void stressTest() {
     using namespace boost::adaptors;
     const auto logSize = 10u;
     auto logToPoison = generateRandomLog(logSize, 10u);
-#if 0
-    fmt::print("stressTest:    size= {}, logToPoison = {}\n", logSize, logToPoison);
-#endif
+    fmt::print("stressTest:    size= {}\n", logSize);
+    printLog(logToPoison);
     auto nodes = std::vector<std::unique_ptr<Node>>();
     for (auto _ : boost::irange(0u, 15u)) {
         auto delayRandomly = static_cast<bool>(getRandom(0u, 1u));
@@ -1047,16 +1014,11 @@ static void stressTest() {
     auto leader = dynamic_cast<Leader*>((*it)->me());
     auto leaderLog = leader->getCurrentLog();
     boost::for_each(nodes, [&leaderLog, logSize](auto &&server){
-       if (auto follower = dynamic_cast<Follower*>(server->me()); follower != nullptr) {
-           assert(follower->verifyLog(leaderLog));
-           assert(follower->commitIndex == logSize && follower->state == State::DONE);
-       } else if (auto leader = dynamic_cast<Leader*>(server->me()); leader != nullptr) {
-            assert(leader->state == State::DONE);
-       } else {
-           assert(false);
-       }
-   });
-   fmt::print("\n");
+        auto node = server->me();
+        assert(node->verifyLog(leaderLog));
+        assert(node->commitIndex == logSize && node->state == State::DONE);
+    });
+    fmt::print("\n");
 }
 
 int main() {
