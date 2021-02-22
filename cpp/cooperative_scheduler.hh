@@ -10,6 +10,7 @@
 #include <unistd.h>
 #include <fmt/core.h>
 #include <valgrind/valgrind.h>
+#include <boost/range/algorithm/for_each.hpp>
 
 class cooperative_scheduler final {
 public:
@@ -19,18 +20,23 @@ public:
     {
         constexpr auto contexts_number = (sizeof...(args))/2u;
         assert(contexts_number > 0u);
-        just_me = this;
-        assert(scheduler_stack);
         // to prevent contexts pointers invalidation
         contexts.reserve(contexts_number);
         make_contexts(std::forward<Args>(args)...);
-        setup_signals();
-        setup_timer(timer_us);
-        assert(contexts.size() == contexts_number);
-        init_scheduler_context();
-        prefix_size = just_me->contexts.size();
-        auto rc = swapcontext(&main_context, &contexts[current_context]);
-        assert(rc >= 0);
+        init(contexts_number);
+    }
+    template<class Fiber, class Arg>
+    cooperative_scheduler(Fiber f, const std::vector<Arg> &args) noexcept
+        : scheduler_stack(std::malloc(stack_size))
+    {
+        auto contexts_number = args.size();
+        assert(contexts_number > 0u);
+        // to prevent contexts pointers invalidation
+        contexts.reserve(contexts_number);
+        boost::for_each(args, [this, f](auto &arg){
+            make_context(f, arg.get());
+        });
+        init(contexts_number);
     }
     cooperative_scheduler(const cooperative_scheduler&) = delete;
     cooperative_scheduler& operator=(const cooperative_scheduler&) = delete;
@@ -52,6 +58,18 @@ public:
 
      static bool debug;
 private:
+    void init(unsigned contexts_number) noexcept {
+        just_me = this;
+        assert(scheduler_stack);
+        setup_signals();
+        setup_timer(timer_us);
+        assert(contexts.size() == contexts_number);
+        init_scheduler_context();
+        prefix_size = just_me->contexts.size();
+        auto rc = swapcontext(&main_context, &contexts[current_context]);
+        assert(rc >= 0);
+    }
+
     template<class Arg>
     void make_contexts(void (*fiber) (Arg*), Arg &arg) noexcept {
         make_context(fiber, &arg);
@@ -166,4 +184,4 @@ private:
 cooperative_scheduler* cooperative_scheduler::just_me = nullptr;
 volatile bool cooperative_scheduler::by_interrupt = false;
 bool cooperative_scheduler::debug = true;
-int cooperative_scheduler::timer_us = (debug)? 100'000 : 10'000; // 100ms or 10ms
+int cooperative_scheduler::timer_us = (debug)? 33'000 : 10'000; // 33ms or 10ms
