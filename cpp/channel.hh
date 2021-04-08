@@ -2,6 +2,9 @@
 #include <fmt/core.h>
 #include <mutex>
 #include <future>
+#include <cassert>
+#include <signal.h>
+#include <time.h>
 
 #ifdef __clang__
     #include <experimental/coroutine>
@@ -43,7 +46,7 @@ struct stdx::coroutine_traits<std::future<R>, Args...> {
     struct promise_type {
         std::promise<R> p;
         suspend_never initial_suspend() { return {}; }
-        suspend_never final_suspend() { return {}; }
+        suspend_never final_suspend() noexcept { return {}; }
         void return_value(R v) {
             p.set_value(v);
         }
@@ -59,7 +62,7 @@ static inline void* poison() noexcept {
     return reinterpret_cast<void*>(0xFADE'038C'BCFA'9E64);
 }
 
-constexpr bool debug = false;
+constexpr bool debug = true;
 
 template <typename T>
 class list {
@@ -359,3 +362,81 @@ public:
         return Reader{*this};
     }
 };
+
+struct AsyncTimer {
+    static void timer(int sig, siginfo_t* si, void*) noexcept {
+        timer_t *tidp = reinterpret_cast<timer_t*>(si->si_value.sival_ptr);
+        fmt::print("handler timerid = {}\n", *tidp);
+        auto real_frame =  (void*)(timerIdToFrame[reinterpret_cast<intptr_t>(*tidp)]);
+        if (auto coro = stdx::coroutine_handle<>::from_address(real_frame)) {
+            coro.resume();
+        }
+    }
+
+   void setup_signals(void *frame) noexcept {
+       struct sigaction sa;
+       sa.sa_flags = SA_SIGINFO;
+       sa.sa_sigaction = timer;
+       sigemptyset(&sa.sa_mask);
+       assert(sigaction(SIGRTMIN, &sa, nullptr) != -1);
+
+       sigevent sev;
+       sev.sigev_notify = SIGEV_SIGNAL;
+       sev.sigev_signo = SIGRTMIN;
+
+       sev.sigev_value.sival_ptr = &timerid;
+       assert(timer_create(CLOCK_REALTIME, &sev, &timerid) != -1);
+       timerIdToFrame.push_back(frame);
+       fmt::print("setup signal for timerid = {}\n", timerid);
+    }
+
+   void setup_timer(long timer_ns) noexcept {
+       itimerspec its;
+       its.it_value.tv_sec = timer_ns / 1'000'000'000;
+       its.it_value.tv_nsec = timer_ns % 1'000'000'000;
+       its.it_interval.tv_sec = its.it_value.tv_sec;
+       its.it_interval.tv_nsec = its.it_value.tv_nsec;
+       assert(timer_settime(timerid, 0, &its, NULL) != -1);
+       fmt::print("setup timer = {} for {} ms \n", timerid, timer_ns/1'000'000);
+   }
+   // FIXME: volatile
+   static std::vector<void*> timerIdToFrame;
+   timer_t timerid;
+};
+std::vector<void*> AsyncTimer::timerIdToFrame = {};
+
+struct [[nodiscard]] DummyAwaitable {
+    unsigned ms;
+    void* frame = nullptr;
+    AsyncTimer timer;
+    static constexpr bool ready = false;
+
+    DummyAwaitable(unsigned ms)
+    : ms(ms) {}
+
+    bool await_ready() {
+        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        return ready;
+    }
+    void await_suspend(stdx::coroutine_handle<> coro) {
+        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        frame = coro.address();
+        // set one-shot timer which fire await_resume after ms
+        timer.setup_signals(frame);
+        timer.setup_timer(ms * 1'000'000);
+    }
+    bool await_resume() {
+        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        timer.setup_timer(0);
+        if (frame) {
+            if (auto coro = stdx::coroutine_handle<>::from_address(frame)) {
+                return true;
+            }
+        }
+        return false;
+    }
+};
+
+DummyAwaitable delay(unsigned time_ms) noexcept {
+    return DummyAwaitable{time_ms};
+}

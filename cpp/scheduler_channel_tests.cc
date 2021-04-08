@@ -200,7 +200,7 @@ static void two_fibers() {
 }
 }
 
-namespace channels_msgs {
+namespace channels_msgs_with_delays {
 
 struct Msg {
     unsigned x;
@@ -212,6 +212,9 @@ static void producer(int*) {
     auto task = []() -> std::future<int> {
         fmt::print("producer: start\n");
         for (auto i = 1u; i <= 5u; i++) {
+            if (i%2 == 1) {
+                co_await delay(100);
+            }
             auto msg = std::make_unique<Msg>(Msg{i*i});
             co_await rpc_channel.write(msg);
             fmt::print("producer wrote\n");
@@ -228,6 +231,9 @@ static void consumer(int*) {
         for (auto i = 1; i <= 5; i++) {
             auto [msg, ok] = co_await rpc_channel.read();
             fmt::print("consumer: {}\n", msg->x);
+            if (i%2 == 1) {
+                co_await delay(50);
+            }
         }
         fmt::print("consumer: end\n");
         co_return 0;
@@ -240,7 +246,26 @@ static void test() {
      auto i = 1, j = 2;
      cooperative_scheduler{producer, i, consumer, j};
 }
+}
 
+// for now only works on clang
+namespace delays {
+
+void test() {
+    fmt::print("{}\n", __PRETTY_FUNCTION__);
+    auto task = []() -> std::future<int> {
+       fmt::print("{}\n", __PRETTY_FUNCTION__);
+       co_await delay(999);
+       fmt::print("1s\n");
+       co_await delay(999);
+       fmt::print("2s\n");
+       co_await delay(999);
+       fmt::print("3s\n");
+       co_return 0;
+    };
+    task().get();
+    fmt::print("Done after 3s\n");
+}
 }
 
 int main() {
@@ -252,6 +277,8 @@ int main() {
 
     channels::one_fiber();
     channels::two_fibers();
-    channels_msgs::test();
+
+    delays::test();
+    channels_msgs_with_delays::test();
     return 0;
 }

@@ -88,6 +88,9 @@ private:
             // it means that old_context finished via uc_link
             std::swap(just_me->contexts[old_context], just_me->contexts[prefix_size-1]);
             prefix_size--;
+            if (debug) {
+                fmt::print("remove fiber {}\n", old_context);
+            }
         }
         by_interrupt = false;
         assert(!just_me->contexts.empty());
