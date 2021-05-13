@@ -1,10 +1,10 @@
 ﻿#pragma once
 #include <fmt/core.h>
-#include <mutex>
 #include <future>
 #include <cassert>
 #include <signal.h>
 #include <time.h>
+#include <optional>
 
 #ifdef __clang__
     #include <experimental/coroutine>
@@ -62,7 +62,7 @@ static inline void* poison() noexcept {
     return reinterpret_cast<void*>(0xFADE'038C'BCFA'9E64);
 }
 
-constexpr bool debug = true;
+bool debug = true;
 
 template <typename T>
 class list {
@@ -99,6 +99,55 @@ class reader;
 template <typename T>
 class writer;
 
+struct AsyncTimer {
+    static void timer(int sig, siginfo_t* si, void*) noexcept {
+        timer_t *tidp = reinterpret_cast<timer_t*>(si->si_value.sival_ptr);
+        if (debug) {
+            fmt::print("handler timerid = {}\n", *tidp);
+        }
+        auto real_frame =  (void*)(timerIdToFrame[reinterpret_cast<intptr_t>(*tidp)]);
+        // FIXME: problem when coroutine is dead
+        if (auto coro = stdx::coroutine_handle<>::from_address(real_frame)) {
+            coro.resume();
+        }
+    }
+
+   void setup_signals(void *ptr) noexcept {
+       struct sigaction sa;
+       sa.sa_flags = SA_SIGINFO;
+       sa.sa_sigaction = timer;
+       sigemptyset(&sa.sa_mask);
+       assert(sigaction(SIGRTMIN, &sa, nullptr) != -1);
+
+       sigevent sev;
+       sev.sigev_notify = SIGEV_SIGNAL;
+       sev.sigev_signo = SIGRTMIN;
+
+       sev.sigev_value.sival_ptr = &timerid;
+       assert(timer_create(CLOCK_REALTIME, &sev, &timerid) != -1);
+       timerIdToFrame.push_back(ptr);
+       if (debug) {
+            fmt::print("setup signal for timerid = {}\n", timerid);
+       }
+    }
+
+   void setup_timer(long timer_ns) noexcept {
+       itimerspec its;
+       its.it_value.tv_sec = timer_ns / 1'000'000'000;
+       its.it_value.tv_nsec = timer_ns % 1'000'000'000;
+       its.it_interval.tv_sec = its.it_value.tv_sec;
+       its.it_interval.tv_nsec = its.it_value.tv_nsec;
+       assert(timer_settime(timerid, 0, &its, NULL) != -1);
+       if (debug) {
+           fmt::print("setup timer = {} for {} ms \n", timerid, timer_ns/1'000'000);
+       }
+   }
+   // FIXME: volatile
+   static std::vector<void*> timerIdToFrame;
+   timer_t timerid;
+};
+std::vector<void*> AsyncTimer::timerIdToFrame = {};
+
 template <typename T>
 class [[nodiscard]] reader final {
 public:
@@ -123,10 +172,13 @@ protected:
         reader* next = nullptr; // Next reader in channel
         channel_type* channel_;     // Channel to push this reader
     };
+    unsigned timeout_ms;
+    std::optional<AsyncTimer> maybe_timer;
+    mutable bool writer_ready = false;
 
 private:
-    explicit reader(channel_type& ch) noexcept
-        : value_ptr{}, frame{}, channel_{std::addressof(ch)} {
+    explicit reader(channel_type& ch, unsigned timeout_ms) noexcept
+        : value_ptr{}, frame{}, channel_{std::addressof(ch)}, timeout_ms(timeout_ms) {
     }
     reader(const reader&) noexcept = delete;
     reader& operator=(const reader&) noexcept = delete;
@@ -136,11 +188,13 @@ public:
         std::swap(value_ptr, rhs.value_ptr);
         std::swap(frame, rhs.frame);
         std::swap(channel_, rhs.channel_);
+        std::swap(maybe_timer, rhs.maybe_timer);
     }
     reader& operator=(reader&& rhs) noexcept {
         std::swap(value_ptr, rhs.value_ptr);
         std::swap(frame, rhs.frame);
         std::swap(channel_, rhs.channel_);
+        std::swap(maybe_timer, rhs.maybe_timer);
         return *this;
     }
     ~reader() noexcept = default;
@@ -157,34 +211,40 @@ public:
         // exchange address & resumeable_handle
         std::swap(value_ptr, w->value_ptr);
         std::swap(frame, w->frame);
+        writer_ready = true;
         return true;
     }
     void await_suspend(stdx::coroutine_handle<> coro) {
         if (debug) {
-            fmt::print("{}\n", __PRETTY_FUNCTION__);
+            fmt::print("{} with timeout = {}ms\n", __PRETTY_FUNCTION__, timeout_ms);
         }
         // notice that next & chan are sharing memory
         auto& ch = *(this->channel_);
-        frame = coro.address(); // remember handle before push/unlock
+        frame = coro.address(); // remember handle before push
         next = nullptr;         // clear to prevent confusing
 
         ch.reader_list::push(this);
+        init_timer(frame);
     }
     std::tuple<value_type, bool> await_resume() {
         // WTF??
         // fmt::print("{} {}\n", __PRETTY_FUNCTION__);
         if (debug) {
-            fmt::print("{}", __PRETTY_FUNCTION__);
+            fmt::print("{}\n", __PRETTY_FUNCTION__);
+        }
+        if (maybe_timer) {
+            maybe_timer->setup_timer(0);
         }
         auto t = std::make_tuple(value_type{}, false);
         // frame holds poision if the channel is going to be destroyed
         if (frame == poison())
             return t;
-
         // Store first. we have to do this because the resume operation
         // can destroy the writer coroutine
         auto& value = std::get<0>(t);
-        value = std::move(*value_ptr);
+        if (value_ptr) {
+            value = std::move(*value_ptr);
+        }
         if (debug) {
             if constexpr(std::is_pointer<T>::value) {
                 fmt::print(" T = {}\n", typeid(*value).name());
@@ -192,11 +252,25 @@ public:
                 fmt::print("\n");
             }
         }
-        if (auto coro = stdx::coroutine_handle<>::from_address(frame))
-            coro.resume();
-
+        // assuming there is writer
+        if (writer_ready) {
+            if (auto coro = stdx::coroutine_handle<>::from_address(frame))
+                coro.resume();
+        }
         std::get<1>(t) = true;
         return t;
+    }
+private:
+    void init_timer(void *ptr) {
+        if (timeout_ms) {
+            if (debug) {
+                fmt::print("{}", __PRETTY_FUNCTION__);
+            }
+            maybe_timer = AsyncTimer();
+            // set one-shot timer which fire await_resume after ms
+            maybe_timer->setup_signals(ptr);
+            maybe_timer->setup_timer(timeout_ms * 1'000'000);
+        }
     }
 };
 
@@ -267,7 +341,7 @@ public:
         // notice that next & chan are sharing memory
         auto& ch = *(this->channel_);
 
-        frame = coro.address(); // remember handle before push/unlock
+        frame = coro.address(); // remember handle before push
         next = nullptr;         // clear to prevent confusing
 
         ch.writer_list::push(this);
@@ -284,7 +358,6 @@ public:
         if (auto coro = stdx::coroutine_handle<>::from_address(frame)) {
             coro.resume();
         }
-
         return true;
     }
 };
@@ -359,51 +432,13 @@ public:
     }
     Reader read() noexcept {
         reader_list& readers = *this;
-        return Reader{*this};
+        return Reader{*this, 0};
+    }
+    Reader readWithTimeout(unsigned timeoutMs) noexcept {
+        reader_list& readers = *this;
+        return Reader{*this, timeoutMs};
     }
 };
-
-struct AsyncTimer {
-    static void timer(int sig, siginfo_t* si, void*) noexcept {
-        timer_t *tidp = reinterpret_cast<timer_t*>(si->si_value.sival_ptr);
-        fmt::print("handler timerid = {}\n", *tidp);
-        auto real_frame =  (void*)(timerIdToFrame[reinterpret_cast<intptr_t>(*tidp)]);
-        if (auto coro = stdx::coroutine_handle<>::from_address(real_frame)) {
-            coro.resume();
-        }
-    }
-
-   void setup_signals(void *frame) noexcept {
-       struct sigaction sa;
-       sa.sa_flags = SA_SIGINFO;
-       sa.sa_sigaction = timer;
-       sigemptyset(&sa.sa_mask);
-       assert(sigaction(SIGRTMIN, &sa, nullptr) != -1);
-
-       sigevent sev;
-       sev.sigev_notify = SIGEV_SIGNAL;
-       sev.sigev_signo = SIGRTMIN;
-
-       sev.sigev_value.sival_ptr = &timerid;
-       assert(timer_create(CLOCK_REALTIME, &sev, &timerid) != -1);
-       timerIdToFrame.push_back(frame);
-       fmt::print("setup signal for timerid = {}\n", timerid);
-    }
-
-   void setup_timer(long timer_ns) noexcept {
-       itimerspec its;
-       its.it_value.tv_sec = timer_ns / 1'000'000'000;
-       its.it_value.tv_nsec = timer_ns % 1'000'000'000;
-       its.it_interval.tv_sec = its.it_value.tv_sec;
-       its.it_interval.tv_nsec = its.it_value.tv_nsec;
-       assert(timer_settime(timerid, 0, &its, NULL) != -1);
-       fmt::print("setup timer = {} for {} ms \n", timerid, timer_ns/1'000'000);
-   }
-   // FIXME: volatile
-   static std::vector<void*> timerIdToFrame;
-   timer_t timerid;
-};
-std::vector<void*> AsyncTimer::timerIdToFrame = {};
 
 struct [[nodiscard]] DummyAwaitable {
     unsigned ms;

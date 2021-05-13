@@ -87,6 +87,11 @@ static void printLog(const std::vector<MetaEntry> &log) {
     fmt::print("\n");
 }
 
+static auto nextInt() {
+    static int i = 0;
+    return ++i;
+}
+
 class Node {
 public:
     Node() = default;
@@ -295,7 +300,7 @@ public:
                 if (!follower->sendHeartbeat(false).get()) {
                     // FIXME: fallback here and there is not the proper way to handle slow Follower
                     fallbackTo(State::CANDIDATE);
-                    return;
+                    return; // different than lambda return!
                 }
             }
             lastApplied++;
@@ -510,8 +515,8 @@ private:
     }
 
     std::future<Message*> receiveRequestVoteReqOrLeaderMessage() {
-        //auto timeoutMs = Generator.nextInt()*rpcTimeoutMs;
-        auto [_msg, ok] = co_await _channel.read();
+        auto timeoutMs = nextInt()*rpcTimeoutMs;
+        auto [_msg, ok] = co_await _channel.readWithTimeout(timeoutMs);
         co_return _msg;
     }
 
@@ -523,8 +528,8 @@ private:
     }
 
     std::future<Message*> receiveRequestVoteRespOrLeaderMessage() {
-        //auto timeoutMs = Generator.nextInt()*rpcTimeoutMs;
-        auto [_msg, ok] = co_await _channel.read();
+        auto timeoutMs = nextInt()*rpcTimeoutMs;
+        auto [_msg, ok] = co_await _channel.readWithTimeout(timeoutMs);
         co_return _msg;
     }
 };
@@ -879,6 +884,8 @@ static void oneFailingLeaderOneFollowerScenarioWithNoConsensus() {
 
 static void oneFailingLeaderOneFollowerScenarioWithConsensus() {
     fmt::print("oneFailingLeaderOneFollowerScenarioWithConsensus\n");
+    cooperative_scheduler::debug = false;
+    ::debug = false;
     auto entriesToReplicate = std::map<char, int> {{'x', 1},{'y', 2}};
     auto nodes = std::vector<std::unique_ptr<Node>>();
     auto stopOnStateChange = true;

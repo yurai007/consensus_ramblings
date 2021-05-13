@@ -2,7 +2,7 @@
 #include "channel.hh"
 #include <fmt/core.h>
 #include <future>
-
+#include <random>
 #include <ucontext.h>
 #include <sys/mman.h>
 #include <valgrind/valgrind.h>
@@ -268,6 +268,68 @@ void test() {
 }
 }
 
+namespace channels_msgs_with_timeouts {
+
+static int getRandom(unsigned from, unsigned to) {
+    static std::random_device device;
+    static std::mt19937 generator(device());
+    std::uniform_int_distribution<> random(from, to);
+    return random(generator);
+}
+
+struct Msg {
+    unsigned content;
+    bool done = false;
+};
+
+channel<std::unique_ptr<Msg>> rpc_channel;
+constexpr auto iters = 30u;
+
+static void producer(int*) {
+    auto task = []() -> std::future<int> {
+        fmt::print("producer: start\n");
+        for (auto i = 1u; i <= iters; i++) {
+            if (getRandom(0,1) == 1) {
+                // backpressure
+                co_await delay(getRandom(40, 100));
+            }
+            auto msg = std::make_unique<Msg>(Msg{i*i, (i == iters)});
+            fmt::print("producer is writing {}\n", i*i);
+            co_await rpc_channel.write(msg);
+        }
+        fmt::print("producer: end\n");
+        co_return 0;
+    };
+    task().get();
+}
+
+static void consumer(int*) {
+    auto task = []() -> std::future<int> {
+        fmt::print("consumer: start\n");
+        while (true) {
+            auto [msg, ok] = co_await rpc_channel.readWithTimeout(getRandom(30, 60));
+            if (msg) {
+                fmt::print("consumer: {}\n", msg->content);
+                if (msg->done) {
+                    break;
+                }
+            } else {
+                fmt::print("consumer: nullptr\n");
+            }
+        }
+        fmt::print("consumer: end\n");
+        co_return 0;
+    };
+    task().get();
+}
+
+static void test() {
+     fmt::print("{}\n", __PRETTY_FUNCTION__);
+     auto i = 1, j = 2;
+     cooperative_scheduler{producer, i, consumer, j};
+}
+}
+
 int main() {
     scheduler::test0();
     scheduler::test1();
@@ -280,5 +342,6 @@ int main() {
 
     delays::test();
     channels_msgs_with_delays::test();
+    channels_msgs_with_timeouts::test();
     return 0;
 }
