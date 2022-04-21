@@ -1,7 +1,6 @@
 ﻿#include "cooperative_scheduler.hh"
 #include "channel.hh"
 #include <boost/range/algorithm.hpp>
-#include <boost/range/algorithm/for_each.hpp>
 #include <boost/range/irange.hpp>
 #include <boost/range/adaptor/map.hpp>
 #include <boost/range/algorithm/copy.hpp>
@@ -17,6 +16,7 @@
 #include <compare>
 #include <memory>
 #include <random>
+#include <algorithm>
 
 // ref: https://raft.github.io/raft.pdf
 
@@ -205,13 +205,10 @@ public:
     }
     virtual ~Follower() = default;
 private:
-#ifndef __clang__
     static_assert(CoroutineChannel<channel, Message*>, "it's important for implementation to have fully preemptable "
                                                        "coroutine channel");
-#endif
     channel<Message*> channelToLeader;
     std::unique_ptr<Message> msg;
-    Message *msg_p = nullptr;
     bool delayed = false;
 
    void shrinkUntil(int index) {
@@ -231,7 +228,7 @@ public:
     std::future<bool> sendHeartbeat(bool done) {
        if (!delayed) {
            msg = std::make_unique<HeartBeat>(done);
-           msg_p = msg.get();
+           auto msg_p = msg.get();
            co_await channelToLeader.write(msg_p);
            co_return true;
        } else {
@@ -256,7 +253,7 @@ public:
 
     std::future<bool> sendAppendEntriesReq(AppendEntriesReq &&req) {
         msg = std::make_unique<AppendEntriesReq>(req);
-        msg_p = msg.get();
+        auto msg_p = msg.get();
         co_await channelToLeader.write(msg_p);
         co_return true;
     }
@@ -268,7 +265,7 @@ public:
 
     std::future<bool> sendAppendEntriesResp(AppendEntriesResp &&rep) {
         msg = std::make_unique<AppendEntriesResp>(rep);
-        msg_p = msg.get();
+        auto msg_p = msg.get();
         co_await channelToLeader.write(msg_p);
         co_return true;
     }
@@ -286,7 +283,7 @@ public:
         Node(_logState, _log, _state),
         followers(_followers),
         entriesToReplicate(_entriesToReplicate) {
-        boost::for_each(followers, [this](auto &&follower){
+        ranges::for_each(followers, [this](auto &&follower){
             nextIndex[follower] = 0;
             matchIndex[follower] = -1;
         });
@@ -309,7 +306,7 @@ public:
             // [5.3]
             log.emplace_back(entry, currentTerm);
             // x = x, as workaround for http://www.open-std.org/jtc1/sc22/wg21/docs/papers/2017/p0588r1.html
-            boost::for_each(followers, [this, metaEntry = MetaEntry{entry, currentTerm}, followerIsDone = false]
+            ranges::for_each(followers, [this, metaEntry = MetaEntry{entry, currentTerm}, followerIsDone = false]
                             (auto &&follower) mutable {
                  auto &it = *follower;
                  do {
@@ -358,7 +355,7 @@ public:
             auto [id, entry_value] = entry;
             logState[id] = entry_value;
             // [5.3]
-            boost::for_each(followers, [this](auto &&it){
+            ranges::for_each(followers, [this](auto &&it){
                 matchIndex[it] = replicaNextIndex(it);
                 nextIndex[it] = replicaNextIndex(it) + 1;
             });
@@ -371,7 +368,7 @@ public:
             commitIndex = std::max(majorityCommitIndex, commitIndex + 1);
             fmt::print("Leader: {} := {}\n", id, entry_value);
         }
-        boost::for_each(followers, [](auto &&follower){
+        ranges::for_each(followers, [](auto &&follower){
             follower->sendHeartbeat(true).get();
         });
         state = State::DONE;
@@ -425,7 +422,7 @@ public:
              if (message != nullptr) {
                    auto vote  = true;
                    if (auto requestVoteReq = dynamic_cast<RequestVoteReq*>(message); !requestVoteReq) {
-                       auto maybeVoter = boost::find_if(otherCandidates, [&](auto &&it){
+                       auto maybeVoter = ranges::find_if(otherCandidates, [&](auto &&it){
                            return it == requestVoteReq->candidateId; });
                        auto voter = *maybeVoter;
                        if (requestVoteReq->term >= currentTerm) {
@@ -458,7 +455,7 @@ public:
                    }
              } else {
                    auto votesForMe = 0u;
-                   boost::for_each(otherCandidates, [this, &votesForMe, &endOfElection, me](auto &&it){
+                   ranges::for_each(otherCandidates, [this, &votesForMe, &endOfElection, me](auto &&it){
                        auto lastLogIndex = log.size() - 1;
                        auto lastLogTerm = (lastLogIndex >= 0u)? log[lastLogIndex].term :0;
                        auto requestVoteReq = RequestVoteReq(currentTerm, this, lastLogIndex, lastLogTerm);
@@ -500,18 +497,15 @@ private:
     int expectedCandidates;
     std::vector<Candidate*> otherCandidates;
     std::unique_ptr<Message> msg;
-    Message *msg_p = nullptr;
-#ifndef __clang__
     static_assert(CoroutineChannel<channel, Message*>, "it's important for implementation to have fully preemptable "
                                                        "coroutine channel");
-#endif
 public:
     channel<Message*> _channel;
 private:
 
     std::future<bool> sendRequestVoteReq(Candidate &candidate, RequestVoteReq &&requestVote) {
         msg = std::make_unique<RequestVoteReq>(requestVote);
-        msg_p = msg.get();
+        auto msg_p = msg.get();
         co_await candidate._channel.write(msg_p);
         co_return true;
     }
@@ -524,7 +518,7 @@ private:
 
     std::future<bool> sendRequestVoteResp(Candidate &candidate, RequestVoteResp &&requestVoteResp) {
         msg = std::make_unique<RequestVoteResp>(requestVoteResp);
-        msg_p = msg.get();
+        auto msg_p = msg.get();
         co_await candidate._channel.write(msg_p);
         co_return true;
     }
@@ -546,7 +540,7 @@ public:
         currentTerm = term;
         log = _log;
         logState.clear();
-        boost::for_each(log, [this](auto &&entry){
+        ranges::for_each(log, [this](auto &&entry){
             auto [e1, e2] = entry.entry;
             logState[e1] = e2;
         });
@@ -666,7 +660,7 @@ static void oneLeaderOneFollowerScenarioWithConsensus() {
     nodes.push_back(std::make_unique<Server>(Instance::LEADER, entriesToReplicate, nodes, false));
     launchServers(serverFiber, nodes);
     auto expectedLog = {MetaEntry{std::tuple{'x', 1}, 1}, MetaEntry{std::tuple{'y', 2}, 1} };
-    boost::for_each(nodes, [&expectedLog](auto &&server){
+    ranges::for_each(nodes, [&expectedLog](auto &&server){
         auto node = server->me();
         assert(node->verifyLog(expectedLog));
         assert(node->commitIndex == 2 && node->currentTerm == 1);
@@ -684,7 +678,7 @@ static void oneLeaderOneFollowerMoreEntriesScenarioWithConsensus() {
     auto expectedLog = {MetaEntry{std::tuple{'1', 1}, 1}, MetaEntry{std::tuple{'2', 2}, 1},
                         MetaEntry{std::tuple{'3', 3}, 1}, MetaEntry{std::tuple{'4', 2}, 1},
                         MetaEntry{std::tuple{'5', 1}, 1}, MetaEntry{std::tuple{'6', 3}, 1}};
-    boost::for_each(nodes, [&expectedLog](auto &&server){
+    ranges::for_each(nodes, [&expectedLog](auto &&server){
         auto node = server->me();
         assert(node->verifyLog(expectedLog));
         assert(node->commitIndex == 6 && node->currentTerm == 1);
@@ -696,14 +690,14 @@ static void oneLeaderManyFollowersScenarioWithConsensus() {
     fmt::print("oneLeaderManyFollowersScenarioWithConsensus\n");
     auto nodes = std::vector<std::unique_ptr<Node>>();
     for (auto _ : boost::irange(0, 12)) {
-        nodes.push_back(std::make_unique<Server>(Instance::FOLLOWER, std::nullopt, nodes, false));
+        nodes.push_back(std::make_unique<Server>(Instance::FOLLOWER, std::nullopt, nodes, false)); (void)_;
     }
     auto entriesToReplicate = std::map<char, int> {{'x', 1},{'y', 2}};
     nodes.push_back(std::make_unique<Server>(Instance::LEADER, entriesToReplicate, nodes, false));
     cooperative_scheduler::debug = false;
     launchServers(serverFiber, nodes);
     auto expectedLog = {MetaEntry{std::tuple{'x', 1}, 1}, MetaEntry{std::tuple{'y', 2}, 1} };
-    boost::for_each(nodes, [&expectedLog](auto &&server){
+    ranges::for_each(nodes, [&expectedLog](auto &&server){
         auto node = server->me();
         assert(node->verifyLog(expectedLog));
         assert(node->commitIndex == 2 && node->currentTerm == 1);
@@ -716,13 +710,13 @@ static void oneLeaderManyFollowersWithArtificialOneScenarioWithConsensus() {
     auto entriesToReplicate = std::map<char, int> {{'x', 1},{'y', 2}};
     auto nodes = std::vector<std::unique_ptr<Node>>();
     for (auto _ : boost::irange(0, 4)) {
-        nodes.push_back(std::make_unique<Server>(Instance::FOLLOWER, std::nullopt, nodes, false));
+        nodes.push_back(std::make_unique<Server>(Instance::FOLLOWER, std::nullopt, nodes, false)); (void)_;
     }
     nodes.push_back(std::make_unique<Server>(Instance::ARTIFICIAL_FOLLOWER, std::nullopt, nodes, false));
     nodes.push_back(std::make_unique<Server>(Instance::LEADER, entriesToReplicate, nodes, false));
     launchServers(serverFiber, nodes);
     auto expectedLog = {MetaEntry{std::tuple{'x', 1}, 1}, MetaEntry{std::tuple{'y', 2}, 1} };
-    boost::for_each(nodes, [&expectedLog](auto &&server){
+    ranges::for_each(nodes, [&expectedLog](auto &&server){
         auto node = server->me();
         assert(node->verifyLog(expectedLog));
         assert(node->commitIndex == 2 && node->currentTerm == 1);
@@ -745,7 +739,7 @@ static void oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus() {
     launchServers(serverFiber, nodes);
     auto expectedLog = {MetaEntry{std::tuple{'a', 1}, 1}, MetaEntry{std::tuple{'b', 2}, 1},
                        MetaEntry{std::tuple{'c', 3}, 2}, MetaEntry{std::tuple{'d', 4}, 2}};
-    boost::for_each(nodes, [&expectedLog](auto &&server){
+    ranges::for_each(nodes, [&expectedLog](auto &&server){
         auto node = server->me();
         assert(node->verifyLog(expectedLog));
         assert(node->commitIndex == 4 && node->currentTerm == 2);
@@ -779,7 +773,7 @@ static void oneLeaderOneFollowerShouldCatchUpWithConsensus() {
                        MetaEntry{std::tuple{'c', 3}, 2}, MetaEntry{std::tuple{'d', 4}, 2},
                        MetaEntry{std::tuple{'e', 5}, 3}};
 
-    boost::for_each(nodes, [&expectedLog](auto &&server){
+    ranges::for_each(nodes, [&expectedLog](auto &&server){
         auto node = server->me();
         assert(node->verifyLog(expectedLog));
         assert(node->commitIndex == 5 && node->currentTerm == 3);
@@ -816,7 +810,7 @@ static void oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus() 
 
     auto expectedLog = {MetaEntry{std::tuple{'a', 1}, 1}, MetaEntry{std::tuple{'c', 3}, 3},
                         MetaEntry{std::tuple{'d', 4}, 3}, MetaEntry{std::tuple{'e', 5}, 4}};
-    boost::for_each(nodes, [&expectedLog](auto &&server){
+    ranges::for_each(nodes, [&expectedLog](auto &&server){
         auto node = server->me();
         assert(node->verifyLog(expectedLog));
         assert(node->commitIndex == 4 && node->currentTerm == 4);
@@ -857,7 +851,7 @@ static void oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithCon
 
     auto expectedLog = {MetaEntry{std::tuple{'a', 1}, 1}, MetaEntry{std::tuple{'c', 3}, 4},
                          MetaEntry{std::tuple{'d', 4}, 4}, MetaEntry{std::tuple{'e', 5}, 5}};
-    boost::for_each(nodes, [&expectedLog](auto &&server){
+    ranges::for_each(nodes, [&expectedLog](auto &&server){
         auto node = server->me();
         assert(node->verifyLog(expectedLog));
         assert(node->commitIndex == 4 && node->currentTerm == 5);
@@ -903,7 +897,7 @@ static void oneFailingLeaderOneFollowerScenarioWithConsensus() {
     assert(oldLeader->state == State::CANDIDATE && oldFollower->state == State::CANDIDATE);
     fmt::print("Term 2 - one wins elections and replicate entries\n");
     launchServers(serverFiber, nodes);
-    boost::for_each(nodes, [](auto &&server){
+    ranges::for_each(nodes, [](auto &&server){
         auto node = server->me();
         assert(node->verifyLog({MetaEntry{std::tuple{'x', 1}, 1}, MetaEntry{std::tuple{'y', 2}, 1}}));
         assert(node->commitIndex == 2 && node->currentTerm == 1);
@@ -929,11 +923,11 @@ static void moreCandidatesInitiateElectionsOneWins() {
     fmt::print("moreCandidatesInitiateElectionsOneWins\n");
     auto nodes = std::vector<std::unique_ptr<Node>>();
     for (auto _ : boost::irange(0, 5)) {
-        nodes.push_back(std::make_unique<Server>(Instance::FOLLOWER, std::nullopt, nodes, false));
+        nodes.push_back(std::make_unique<Server>(Instance::FOLLOWER, std::nullopt, nodes, false)); (void)_;
     }
     fmt::print("All servers become candidates, one wins elections\n");
     launchServers(serverFiber, nodes);
-    boost::for_each(nodes, [](auto &&server){
+    ranges::for_each(nodes, [](auto &&server){
         auto node = server->me();
         assert(node->state == State::DONE);
     });
@@ -948,7 +942,7 @@ static void twoCandidatesInitiateElectionsOneWinsWithConsensus() {
     nodes.push_back(std::make_unique<Server>(Instance::FOLLOWER, entriesToReplicate, nodes, false));
     fmt::print("All servers become candidates, one wins elections and replicate entries\n");
     launchServers(serverFiber, nodes);
-    boost::for_each(nodes, [](auto &&server){
+    ranges::for_each(nodes, [](auto &&server){
         auto node = server->me();
         assert(node->verifyLog({MetaEntry{std::tuple{'1', 1}, 1}, MetaEntry{std::tuple{'2', 2}, 1},
                                 MetaEntry{std::tuple{'3', 3}, 1}, MetaEntry{std::tuple{'4', 4}, 1},
@@ -964,11 +958,11 @@ static void moreCandidatesInitiateElectionsOneWinsWithConsensus() {
     auto entriesToReplicate = std::map<char, int> {{'1', 1},{'2', 2},{'3', 3},{'4', 4},{'5', 5},{'6', 6}};
     auto nodes = std::vector<std::unique_ptr<Node>>();
     for (auto _ : boost::irange(0, 5)) {
-        nodes.push_back(std::make_unique<Server>(Instance::FOLLOWER, entriesToReplicate, nodes, false));
+        nodes.push_back(std::make_unique<Server>(Instance::FOLLOWER, entriesToReplicate, nodes, false)); (void)_;
     }
     fmt::print("All servers become candidates, one wins elections and replicate entries\n");
     launchServers(serverFiber, nodes);
-    boost::for_each(nodes, [](auto &&server){
+    ranges::for_each(nodes, [](auto &&server){
         auto node = server->me();
         assert(node->verifyLog({MetaEntry{std::tuple{'1', 1}, 1}, MetaEntry{std::tuple{'2', 2}, 1},
                                 MetaEntry{std::tuple{'3', 3}, 1}, MetaEntry{std::tuple{'4', 4}, 1},
@@ -990,7 +984,7 @@ static std::vector<MetaEntry> generateRandomLog(unsigned size, int maxTerm)  {
     //using namespace boost::adaptors;
     auto randomLog = std::vector<MetaEntry>();
     for (auto _ : boost::irange(0u, size)) {
-        auto i = getRandom(1, maxTerm);
+        auto i = getRandom(1, maxTerm); _;
         randomLog.push_back(MetaEntry{std::tuple{'a', i}, i});
     }
 #if 0 // FIXME
@@ -1007,7 +1001,7 @@ static void stressTest() {
     printLog(logToPoison);
     auto nodes = std::vector<std::unique_ptr<Node>>();
     for (auto _ : boost::irange(0u, 15u)) {
-        auto delayRandomly = static_cast<bool>(getRandom(0u, 1u));
+        auto delayRandomly = static_cast<bool>(getRandom(0u, 1u)); (void)_;
         auto follower = std::make_unique<Server>(Instance::ARTIFICIAL_FOLLOWER, std::nullopt, nodes, false, delayRandomly);
         auto afollower = dynamic_cast<ArtificialFollower*>(follower->me());
         auto filteredLog = boost::copy_range<std::vector<MetaEntry>>(logToPoison | filtered([](auto &&){
@@ -1018,11 +1012,11 @@ static void stressTest() {
     fmt::print("All servers become candidates, eventually one of injected log should be replicated to all\n");
     launchServers(serverFiber, nodes);
 
-    auto it = boost::range::find_if(nodes, [](auto &&node) { return dynamic_cast<Leader*>(node->me()) != nullptr; });
+    auto it = ranges::find_if(nodes, [](auto &&node) { return dynamic_cast<Leader*>(node->me()) != nullptr; });
     assert(it != nodes.end());
     auto leader = dynamic_cast<Leader*>((*it)->me());
     auto leaderLog = leader->getCurrentLog();
-    boost::for_each(nodes, [&leaderLog, logSize](auto &&server){
+    ranges::for_each(nodes, [&leaderLog, logSize](auto &&server){
         auto node = server->me();
         assert(node->verifyLog(leaderLog));
         assert(node->commitIndex == logSize && node->state == State::DONE);

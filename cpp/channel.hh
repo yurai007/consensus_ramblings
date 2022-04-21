@@ -4,18 +4,21 @@
 #include <cassert>
 #include <signal.h>
 #include <time.h>
+#include <concepts>
 #include <optional>
+#include <algorithm>
 
 #ifdef __clang__
     #include <experimental/coroutine>
+    #include <boost/range/algorithm/for_each.hpp>
     namespace stdx = std::experimental;
+    namespace ranges = boost;
 #else
     #include <coroutine>
     namespace stdx = std;
+    namespace ranges = std::ranges;
 #endif
 
-
-#ifndef __clang__
 namespace internal {
 
 template<class T>
@@ -36,9 +39,9 @@ concept CoroutineChannelAux = requires (Channel<T>& c, T &t, Writer &w, Reader &
 
 template< template <class U> class Channel, class T>
 concept CoroutineChannel = requires (Channel<T> &c) {
-    internal::CoroutineChannelAux<Channel, typename Channel<T>::value_type, typename Channel<T>::Writer, typename Channel<T>::Reader>;
+    internal::CoroutineChannelAux<Channel, typename Channel<T>::value_type,
+        typename Channel<T>::Writer, typename Channel<T>::Reader>;
 };
-#endif
 
 template <typename R, typename... Args>
 struct stdx::coroutine_traits<std::future<R>, Args...> {
@@ -100,7 +103,7 @@ template <typename T>
 class writer;
 
 struct AsyncTimer {
-    static void timer(int sig, siginfo_t* si, void*) noexcept {
+    static void timer(int, siginfo_t* si, void*) noexcept {
         timer_t *tidp = reinterpret_cast<timer_t*>(si->si_value.sival_ptr);
         if (debug) {
             fmt::print("handler timerid = {}\n", *tidp);
@@ -177,8 +180,8 @@ protected:
     mutable bool writer_ready = false;
 
 private:
-    explicit reader(channel_type& ch, unsigned timeout_ms) noexcept
-        : value_ptr{}, frame{}, channel_{std::addressof(ch)}, timeout_ms(timeout_ms) {
+    explicit reader(channel_type& ch, unsigned _timeout_ms) noexcept
+        : value_ptr{}, frame{}, channel_{std::addressof(ch)}, timeout_ms(_timeout_ms) {
     }
     reader(const reader&) noexcept = delete;
     reader& operator=(const reader&) noexcept = delete;
@@ -300,7 +303,7 @@ private:
     };
 
 private:
-    explicit writer(channel_type& ch, pointer pv) noexcept
+    explicit writer(channel_type& ch, const pointer pv) noexcept
         : value_ptr{pv}, frame{}, channel_{std::addressof(ch)} {
     }
     writer(const writer&) noexcept = delete;
@@ -431,11 +434,9 @@ public:
         return Writer{*this, std::addressof(ref)};
     }
     Reader read() noexcept {
-        reader_list& readers = *this;
         return Reader{*this, 0};
     }
     Reader readWithTimeout(unsigned timeoutMs) noexcept {
-        reader_list& readers = *this;
         return Reader{*this, timeoutMs};
     }
 };
@@ -446,8 +447,8 @@ struct [[nodiscard]] DummyAwaitable {
     AsyncTimer timer;
     static constexpr bool ready = false;
 
-    DummyAwaitable(unsigned ms)
-    : ms(ms) {}
+    DummyAwaitable(unsigned _ms)
+    : ms(_ms) {}
 
     bool await_ready() {
         fmt::print("{}\n", __PRETTY_FUNCTION__);

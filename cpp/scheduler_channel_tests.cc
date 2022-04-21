@@ -15,50 +15,6 @@
     namespace stdx = std;
 #endif
 
-    // those hacks are not needed anymore - completed fibers are removed from
-    // scheduler and the rest continue execution
-    #if 0
-    namespace with_proper_cleanup {
-
-    std::promise<bool> done;
-    std::future<bool> donef = done.get_future();
-
-    static void fiber0(int *p) {
-        auto task = [p]() -> std::future<int> {
-            fmt::print("fiber0: started\n");
-            auto n = sleep(5);
-            fmt::print("fiber0: before 2nd sleep {}s\n", n);
-            sleep(5);
-            fmt::print("fiber0: {}\n", *p);
-            fmt::print("fiber0: returning\n");
-            co_return 0;
-        };
-        task().get();
-        donef.get();
-    }
-
-    static void fiber1(int *p) {
-        auto task = [p]() -> std::future<int> {
-            fmt::print("fiber1: started\n");
-            auto n = sleep(2);
-            n = sleep(5);
-            fmt::print("fiber1: after sleep {}s\n", n);
-            fmt::print("fiber1: {}\n", *p);
-            fmt::print("fiber1: returning\n");
-            co_return 0;
-        };
-        task().get();
-        done.set_value(true);
-    }
-
-    void test() {
-       int p1 = 123, p2 = 321;
-       cooperative_scheduler{fiber0, p1, fiber1, p2};
-       fmt::print("end of scope\n\n");
-    }
-    }
-    #endif
-
 namespace scheduler {
 
 void fiber0(int *) {
