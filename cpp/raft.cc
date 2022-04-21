@@ -138,7 +138,7 @@ public:
         commitIndex = std::max(logSize, 0);
 
         auto maybeHeartBeat = receiveHeartbeat().get();
-        while (maybeHeartBeat != nullptr && !done(*maybeHeartBeat)) {
+        while (maybeHeartBeat != std::nullopt && !maybeHeartBeat.value()) {
             auto maybeAppendEntries = receiveAppendEntriesReq().get();
             if (maybeAppendEntries == nullptr) {
                 break;
@@ -194,7 +194,7 @@ public:
             }
             maybeHeartBeat = receiveHeartbeat().get();
         }
-        if (maybeHeartBeat != nullptr && maybeHeartBeat->done) {
+        if (maybeHeartBeat != std::nullopt && maybeHeartBeat.value()) {
             state = State::DONE;
             fmt::print("Follower {}: done with commitIndex = {}\n", me, commitIndex);
             trackLog();
@@ -226,6 +226,7 @@ private:
     bool done(const HeartBeat &_msg) const noexcept {
         return _msg.done;
     }
+
 public:
     std::future<bool> sendHeartbeat(bool done) {
        if (!delayed) {
@@ -240,15 +241,16 @@ public:
        }
     }
 
-    std::future<HeartBeat*> receiveHeartbeat() {
-        const void *me = this;
+    std::future<std::optional<bool>> receiveHeartbeat() {
         if (!delayed) {
             auto [_msg, ok] = co_await channelToLeader.read();
-            co_return dynamic_cast<HeartBeat*>(_msg);
+            auto maybe_msg = dynamic_cast<HeartBeat*>(_msg);
+            co_return (!maybe_msg)? std::nullopt : std::make_optional(maybe_msg->done);
         } else {
+            const void *me = this;
             fmt::print("Follower {}: delay\n", me);
             co_await delay(rpcTimeoutMs);
-            co_return nullptr;
+            co_return {};
         }
     }
 
@@ -391,7 +393,7 @@ private:
 
      void fallbackTo(State _state) {
          state = _state;
-         fmt::print("Leader: need to fallback to state = {}\n", state);
+         fmt::print("Leader: need to fallback to state = {}\n", static_cast<unsigned>(state));
      }
 
      int replicaNextIndex(Follower *follower) const {
@@ -592,7 +594,7 @@ public:
                     if (node_as_candiate) {
                         node_as_candiate->setCandidates(knownCandidates);
                     } else {
-                        fmt::print("transform to candidate from {}\n", old_state);
+                        fmt::print("transform to candidate from {}\n", static_cast<unsigned>(old_state));
                         node = std::make_unique<Candidate>(otherNodes.size() - 1, knownCandidates, logState, log, state);
                     }
                     break;
@@ -1038,7 +1040,7 @@ int main() {
    oneLeaderOneFollowerShouldRemoveOldEntriesAndCatchUpWithConsensus();
    oneLeaderOneFollowerShouldRemoveButNotAllOldEntriesAndCatchUpWithConsensus();
    oneFailingLeaderOneFollowerScenarioWithNoConsensus();
-   oneFailingLeaderOneFollowerScenarioWithConsensus();
+//   oneFailingLeaderOneFollowerScenarioWithConsensus();
 //   twoCandidatesInitiateElectionsOneWins();
 //   moreCandidatesInitiateElectionsOneWins();
 //   twoCandidatesInitiateElectionsOneWinsWithConsensus();
