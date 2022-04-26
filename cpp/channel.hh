@@ -106,9 +106,11 @@ struct AsyncTimer {
     static void timer(int, siginfo_t* si, void*) noexcept {
         timer_t *tidp = reinterpret_cast<timer_t*>(si->si_value.sival_ptr);
         if (debug) {
-            fmt::print("handler timerid = {}\n", *tidp);
+            fmt::print("handler timer id = {}\n", *tidp);
         }
-        auto real_frame =  (void*)(timerIdToFrame[reinterpret_cast<intptr_t>(*tidp)]);
+        auto id = reinterpret_cast<intptr_t>(*tidp);
+        assert(0 <= id && id < (int)timerIdToFrame.size());
+        auto real_frame = (void*)(timerIdToFrame[id]);
         // FIXME: problem when coroutine is dead
         if (auto coro = stdx::coroutine_handle<>::from_address(real_frame)) {
             coro.resume();
@@ -136,13 +138,13 @@ struct AsyncTimer {
 
    void setup_timer(long timer_ns) noexcept {
        itimerspec its;
-       its.it_value.tv_sec = timer_ns / 1'000'000'000;
+       its.it_value.tv_sec = timer_ns / 1'000'000'000L;
        its.it_value.tv_nsec = timer_ns % 1'000'000'000;
        its.it_interval.tv_sec = its.it_value.tv_sec;
        its.it_interval.tv_nsec = its.it_value.tv_nsec;
        assert(timer_settime(timerid, 0, &its, NULL) != -1);
        if (debug) {
-           fmt::print("setup timer = {} for {} ms \n", timerid, timer_ns/1'000'000);
+           fmt::print("setup timer = {} for {} ms\n", timerid, timer_ns/1'000'000);
        }
    }
    // FIXME: volatile
@@ -200,7 +202,10 @@ public:
         std::swap(maybe_timer, rhs.maybe_timer);
         return *this;
     }
-    ~reader() noexcept = default;
+    ~reader() noexcept {
+        if (maybe_timer)
+            maybe_timer->setup_timer(0);
+    }
 
 public:
     bool await_ready() const  {
@@ -224,14 +229,13 @@ public:
         // notice that next & chan are sharing memory
         auto& ch = *(this->channel_);
         frame = coro.address(); // remember handle before push
-        next = nullptr;         // clear to prevent confusing
+        // doing: next = nullptr;  make it impossible to get channel in await_resume
+        //      and pop it from reader_list to prevent seeing dangling readers from ~channel POV.
 
         ch.reader_list::push(this);
         init_timer(frame);
     }
     std::tuple<value_type, bool> await_resume() {
-        // WTF??
-        // fmt::print("{} {}\n", __PRETTY_FUNCTION__);
         if (debug) {
             fmt::print("{}\n", __PRETTY_FUNCTION__);
         }
@@ -250,7 +254,8 @@ public:
         }
         if (debug) {
             if constexpr(std::is_pointer<T>::value) {
-                fmt::print(" T = {}\n", typeid(*value).name());
+                if (value)
+                    fmt::print(" with T = {}\n", typeid(*value).name());
             } else {
                 fmt::print("\n");
             }
@@ -259,6 +264,15 @@ public:
         if (writer_ready) {
             if (auto coro = stdx::coroutine_handle<>::from_address(frame))
                 coro.resume();
+        }
+
+        if (maybe_timer) {
+            auto& ch = this->channel_;
+            assert(ch);
+            if (!ch->reader_list::is_empty()) {
+                auto ptr = ch->reader_list::pop();
+                assert(ptr == this);
+            }
         }
         std::get<1>(t) = true;
         return t;
@@ -272,7 +286,8 @@ private:
             maybe_timer = AsyncTimer();
             // set one-shot timer which fire await_resume after ms
             maybe_timer->setup_signals(ptr);
-            maybe_timer->setup_timer(timeout_ms * 1'000'000);
+            auto timeout_ns = static_cast<long>(timeout_ms) * 1'000'000L;
+            maybe_timer->setup_timer(timeout_ns);
         }
     }
 };
@@ -353,9 +368,8 @@ public:
         if (debug) {
             fmt::print("{}\n", __PRETTY_FUNCTION__);
         }
-        // frame holds poision if the channel is going to destroy
+        // frame holds poison if the channel is going to destroy
         if (frame == poison()) {
-            fmt::print("poison\n");
             return false;
         }
         if (auto coro = stdx::coroutine_handle<>::from_address(frame)) {
@@ -441,13 +455,13 @@ public:
     }
 };
 
-struct [[nodiscard]] DummyAwaitable {
+struct [[nodiscard]] TimerAwaitable {
     unsigned ms;
     void* frame = nullptr;
     AsyncTimer timer;
     static constexpr bool ready = false;
 
-    DummyAwaitable(unsigned _ms)
+    TimerAwaitable(unsigned _ms)
     : ms(_ms) {}
 
     bool await_ready() {
@@ -473,6 +487,6 @@ struct [[nodiscard]] DummyAwaitable {
     }
 };
 
-DummyAwaitable delay(unsigned time_ms) noexcept {
-    return DummyAwaitable{time_ms};
+TimerAwaitable delay(unsigned time_ms) noexcept {
+    return TimerAwaitable{time_ms};
 }
