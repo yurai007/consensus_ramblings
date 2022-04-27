@@ -1041,12 +1041,14 @@ static void stressTest() {
     fmt::print("\n");
 }
 
+constexpr auto infinity = 99'000;
+
 int main() {
    cooperative_scheduler::debug = false;
    ::debug = false;
    oneLeaderOneFollowerScenarioWithConsensus();
    oneLeaderOneFollowerMoreEntriesScenarioWithConsensus();
-   Node::rpcHeartbeatTimeoutMs = 20'000;
+   Node::rpcHeartbeatTimeoutMs = infinity;
    oneLeaderManyFollowersScenarioWithConsensus();
    oneLeaderManyFollowersWithArtificialOneScenarioWithConsensus();
    oneLeaderOneFollowerWithArtificialOneScenarioWithConsensus();

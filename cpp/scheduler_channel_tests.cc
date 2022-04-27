@@ -156,7 +156,7 @@ static void two_fibers() {
 }
 }
 
-namespace channels_msgs_with_delays {
+namespace producer_consumer_one_directional_channel_msgs_with_delays {
 
 struct Msg {
     unsigned x;
@@ -224,8 +224,6 @@ void test() {
 }
 }
 
-namespace channels_msgs_with_timeouts {
-
 static int getRandom(unsigned from, unsigned to) {
     static std::random_device device;
     static std::mt19937 generator(device());
@@ -238,6 +236,8 @@ struct Msg {
     bool done = false;
 };
 
+namespace producer_consumer_one_directional_channel_msgs_with_timeouts {
+
 channel<std::unique_ptr<Msg>> rpc_channel;
 constexpr auto iters = 30u;
 
@@ -247,7 +247,8 @@ static void producer(int*) {
         for (auto i = 1u; i <= iters; i++) {
             if (getRandom(0,1) == 1) {
                 // backpressure
-                co_await delay(getRandom(40, 100));
+                auto r = getRandom(10, 100);
+                co_await delay(r);
             }
             auto msg = std::make_unique<Msg>(Msg{i*i, (i == iters)});
             fmt::print("producer is writing {}\n", i*i);
@@ -263,7 +264,8 @@ static void consumer(int*) {
     auto task = []() -> std::future<int> {
         fmt::print("consumer: start\n");
         while (true) {
-            auto [msg, ok] = co_await rpc_channel.readWithTimeout(getRandom(30, 60));
+            auto timeout = getRandom(10, 100);
+            auto [msg, ok] = co_await rpc_channel.readWithTimeout(timeout);
             if (msg) {
                 fmt::print("consumer: {}\n", msg->content);
                 if (msg->done) {
@@ -282,7 +284,57 @@ static void consumer(int*) {
 static void test() {
      fmt::print("{}\n", __PRETTY_FUNCTION__);
      auto i = 1, j = 2;
-     cooperative_scheduler{producer, i, consumer, j};
+     cooperative_scheduler::debug = true;
+     ::debug = true;
+     cooperative_scheduler{consumer, i, producer, j};
+}
+}
+
+
+namespace producer_consumer_one_directional_channel_msgs_with_timeouts_destroying_channel {
+
+std::unique_ptr<channel<Msg*>> rpc;
+constexpr auto iters = 5u;
+
+static void producer(int*) {
+    auto task = []() -> std::future<int> {
+        fmt::print("producer: start\n");
+        co_await delay(40);
+        fmt::print("producer: end\n");
+        rpc = nullptr;
+        co_await delay(100);
+        co_return 0;
+    };
+    task().get();
+}
+
+static void consumer(int*) {
+    auto task = []() -> std::future<int> {
+        fmt::print("consumer: start\n");
+        {
+            auto [msg, ok] = co_await rpc->readWithTimeout(80);
+            if (msg) {
+                fmt::print("consumer: {}\n", msg->content);
+                if (msg->done) {
+                    fmt::print("consumer: done\n");
+                }
+            } else {
+                fmt::print("consumer: nullptr\n");
+            }
+        }
+        fmt::print("consumer: end\n");
+        co_return 0;
+    };
+    task().get();
+}
+
+static void test() {
+     fmt::print("{}\n", __PRETTY_FUNCTION__);
+     auto i = 1, j = 2;
+     cooperative_scheduler::debug = true;
+     ::debug = true;
+     rpc = std::make_unique<channel<Msg*>>();
+     cooperative_scheduler{consumer, i, producer, j};
 }
 }
 
@@ -297,7 +349,8 @@ int main() {
     channels::two_fibers();
 
     delays::test();
-    channels_msgs_with_delays::test();
-    channels_msgs_with_timeouts::test();
+    producer_consumer_one_directional_channel_msgs_with_delays::test();
+    producer_consumer_one_directional_channel_msgs_with_timeouts::test();
+    producer_consumer_one_directional_channel_msgs_with_timeouts_destroying_channel::test();
     return 0;
 }
