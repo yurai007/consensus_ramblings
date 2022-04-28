@@ -141,8 +141,8 @@ class Follower : public Node {
 public:
     Follower() = default;
     Follower(const std::map<char, int> &_logState, const std::vector<MetaEntry> &_log, State _state, bool _delayed,
-             std::vector<std::unique_ptr<Message>> &&pendingMsgs = {})
-        : Node(_logState, _log, _state), pendingMsgs(std::move(pendingMsgs)), delayed(_delayed) {}
+             std::vector<std::unique_ptr<Message>> && _pendingMsgs = {})
+        : Node(_logState, _log, _state), pendingMsgs(std::move(_pendingMsgs)), delayed(_delayed) {}
 
     void run() override {
         const void *me = this;
@@ -258,7 +258,7 @@ public:
         if (!delayed) {
             auto [_msg, ok] = co_await channelToLeader.readWithTimeout(rpcHeartbeatTimeoutMs);
             auto maybe_msg = dynamic_cast<HeartBeat*>(_msg);
-            co_return (!maybe_msg)? std::nullopt : std::make_optional(maybe_msg->done);
+            co_return maybe_msg? std::make_optional(maybe_msg->done) : std::nullopt;
         } else {
             co_await delay(rpcTimeoutMs);
             co_return {};
@@ -266,10 +266,8 @@ public:
     }
 
     std::future<bool> sendAppendEntriesReq(AppendEntriesReq &&req) {
-        auto msg = std::make_unique<AppendEntriesReq>(req);
-        Message *msg_p = msg.get();
-        pendingMsgs.push_back(std::move(msg));
-        co_await channelToLeader.write(msg_p);
+        pendingMsgs.push_back(std::make_unique<AppendEntriesReq>(req));
+        co_await channelToLeader.write(pendingMsgs.back().get());
         co_return true;
     }
 
@@ -279,10 +277,8 @@ public:
     }
 
     std::future<bool> sendAppendEntriesResp(AppendEntriesResp &&rep) {
-        auto msg = std::make_unique<AppendEntriesResp>(rep);
-        Message *msg_p = msg.get();
-        pendingMsgs.push_back(std::move(msg));
-        co_await channelToLeader.write(msg_p);
+        pendingMsgs.push_back(std::make_unique<AppendEntriesResp>(rep));
+        co_await channelToLeader.write(pendingMsgs.back().get());
         co_return true;
     }
 
@@ -528,8 +524,7 @@ private:
 
     std::future<bool> sendRequestVoteReq(Candidate &candidate, RequestVoteReq &&requestVote) {
         pendingMsgs.push_back(std::make_unique<RequestVoteReq>(requestVote));
-        auto msg_p = pendingMsgs.back().get();
-        co_await candidate._channel.write(msg_p);
+        co_await candidate._channel.write(pendingMsgs.back().get());
         co_return true;
     }
 
@@ -541,8 +536,7 @@ private:
 
     std::future<bool> sendRequestVoteResp(Candidate &candidate, RequestVoteResp &&requestVoteResp) {
         pendingMsgs.push_back(std::make_unique<RequestVoteResp>(requestVoteResp));
-        auto msg_p = pendingMsgs.back().get();
-        co_await candidate._channel.write(msg_p);
+        co_await candidate._channel.write(pendingMsgs.back().get());
         co_return true;
     }
 

@@ -158,7 +158,6 @@ class [[nodiscard]] reader final {
 public:
     using value_type = T;
     using pointer = T*;
-    using reference = T&;
     using channel_type = channel<T>;
 
 private:
@@ -299,7 +298,6 @@ class [[nodiscard]] writer final {
 public:
     using value_type = T;
     using pointer = T*;
-    using reference = T&;
     using channel_type = channel<T>;
 
 private:
@@ -389,7 +387,6 @@ class channel final : list<reader<T>>, list<writer<T>> {
 public:
     using value_type = T;
     using pointer = value_type*;
-    using reference = value_type&;
     using Reader = reader<value_type>;
     using Writer = writer<value_type>;
 private:
@@ -445,9 +442,11 @@ public:
     }
 
 public:
-    Writer write(reference ref) noexcept {
+    template<typename U>
+    Writer write(U &&ref) noexcept {
         return Writer{*this, std::addressof(ref)};
     }
+
     Reader read() noexcept {
         return Reader{*this, 0};
     }

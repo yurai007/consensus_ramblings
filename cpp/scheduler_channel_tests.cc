@@ -294,7 +294,6 @@ static void test() {
 namespace producer_consumer_one_directional_channel_msgs_with_timeouts_destroying_channel {
 
 std::unique_ptr<channel<Msg*>> rpc;
-constexpr auto iters = 5u;
 
 static void producer(int*) {
     auto task = []() -> std::future<int> {
@@ -338,6 +337,61 @@ static void test() {
 }
 }
 
+
+namespace producer_consumer_one_directional_channel_msgs_with_timeouts_lvalue_write {
+
+channel<Msg*> rpc;
+constexpr auto iters = 5u;
+
+static void producer(int*) {
+    auto task = []() -> std::future<int> {
+        fmt::print("producer: start\n");
+        for (auto i = 1u; i <= iters; i++) {
+            if (getRandom(0,1) == 1) {
+                // backpressure
+                auto r = getRandom(10, 100);
+                co_await delay(r);
+            }
+            auto msg = std::make_unique<Msg>(Msg{i*i, (i == iters)});
+            fmt::print("producer is writing {}\n", i*i);
+            co_await rpc.write(msg.get());
+        }
+        fmt::print("producer: end\n");
+        co_return 0;
+    };
+    task().get();
+}
+
+static void consumer(int*) {
+    auto task = []() -> std::future<int> {
+        fmt::print("consumer: start\n");
+        while (true) {
+            auto timeout = getRandom(10, 100);
+            auto [msg, ok] = co_await rpc.readWithTimeout(timeout);
+            if (msg) {
+                fmt::print("consumer: {}\n", msg->content);
+                if (msg->done) {
+                    break;
+                }
+            } else {
+                fmt::print("consumer: nullptr\n");
+            }
+        }
+        fmt::print("consumer: end\n");
+        co_return 0;
+    };
+    task().get();
+}
+
+static void test() {
+     fmt::print("{}\n", __PRETTY_FUNCTION__);
+     auto i = 1, j = 2;
+     cooperative_scheduler::debug = true;
+     ::debug = true;
+     cooperative_scheduler{consumer, i, producer, j};
+}
+}
+
 int main() {
     scheduler::test0();
     scheduler::test1();
@@ -352,5 +406,6 @@ int main() {
     producer_consumer_one_directional_channel_msgs_with_delays::test();
     producer_consumer_one_directional_channel_msgs_with_timeouts::test();
     producer_consumer_one_directional_channel_msgs_with_timeouts_destroying_channel::test();
+    producer_consumer_one_directional_channel_msgs_with_timeouts_lvalue_write::test();
     return 0;
 }
