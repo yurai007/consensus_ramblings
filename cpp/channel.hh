@@ -203,8 +203,9 @@ public:
         return *this;
     }
     ~reader() noexcept {
-        if (maybe_timer)
+        if (maybe_timer) {
             maybe_timer->setup_timer(0);
+        }
     }
 
 public:
@@ -270,8 +271,9 @@ public:
             auto& ch = this->channel_;
             assert(ch);
             if (!ch->reader_list::is_empty()) {
-                auto ptr = ch->reader_list::pop();
-                assert(ptr == this);
+                auto reader_ptr = ch->reader_list::pop();
+                assert(reader_ptr == this);
+                maybe_timer->setup_timer(0);
             }
         }
         std::get<1>(t) = true;
@@ -437,7 +439,6 @@ public:
                 auto r = readers.pop();
                 auto coro = stdx::coroutine_handle<>::from_address(r->frame);
                 r->frame = poison();
-
                 coro.resume();
             }
         }
@@ -465,18 +466,21 @@ struct [[nodiscard]] TimerAwaitable {
     : ms(_ms) {}
 
     bool await_ready() {
-        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        if (debug)
+            fmt::print("{}\n", __PRETTY_FUNCTION__);
         return ready;
     }
     void await_suspend(stdx::coroutine_handle<> coro) {
-        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        if (debug)
+            fmt::print("{}\n", __PRETTY_FUNCTION__);
         frame = coro.address();
         // set one-shot timer which fire await_resume after ms
         timer.setup_signals(frame);
         timer.setup_timer(ms * 1'000'000);
     }
     bool await_resume() {
-        fmt::print("{}\n", __PRETTY_FUNCTION__);
+        if (debug)
+            fmt::print("{}\n", __PRETTY_FUNCTION__);
         timer.setup_timer(0);
         if (frame) {
             if (auto coro = stdx::coroutine_handle<>::from_address(frame)) {

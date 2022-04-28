@@ -43,6 +43,9 @@ struct MetaEntry {
         auto first = term == rhs.term;
         return first? (entry == rhs.entry) : false;
     }
+    bool operator<(const MetaEntry& rhs) const noexcept {
+        return term < rhs.term;
+    }
 };
 
 struct AppendEntriesReq final : Message {
@@ -113,6 +116,14 @@ public:
         return expectedLog == log;
     }
 
+    template<class T, class Container>
+    static std::vector<T*> getFilteredNodes(const Container &nodes, Node *me) {
+        using namespace boost::adaptors;
+        return boost::copy_range<std::vector<T*>>(nodes
+            | transformed([](auto &&it){ return dynamic_cast<T*>(it->me()); })
+            | filtered([me](auto &&it){ return bool(it) && it != me; }));
+    }
+
 protected:
     std::map<char, int> logState;
     std::vector<MetaEntry> log;
@@ -129,8 +140,9 @@ int Node::rpcHeartbeatTimeoutMs = Node::rpcTimeoutMs;
 class Follower : public Node {
 public:
     Follower() = default;
-    Follower(const std::map<char, int> &_logState, const std::vector<MetaEntry> &_log, State _state, bool _delayed)
-        : Node(_logState, _log, _state), delayed(_delayed) {}
+    Follower(const std::map<char, int> &_logState, const std::vector<MetaEntry> &_log, State _state, bool _delayed,
+             std::vector<std::unique_ptr<Message>> &&pendingMsgs = {})
+        : Node(_logState, _log, _state), pendingMsgs(std::move(pendingMsgs)), delayed(_delayed) {}
 
     void run() override {
         const void *me = this;
@@ -159,7 +171,7 @@ public:
                    currentTerm = appendEntries.term;
                 }
                 if (prevIndex >= 0) {
-                    if (prevIndex < log.size()) { // WTF, logSize is wrong (0) but log.size() ok?
+                    if (prevIndex < log.size()) {
                         // [2]
                         if (log[prevIndex].term != prevTerm) {
                             apply = false;
@@ -211,9 +223,7 @@ private:
     static_assert(CoroutineChannel<channel, Message*>, "it's important for implementation to have fully preemptable "
                                                        "coroutine channel");
     channel<Message*> channelToLeader;
-public:
-    std::unique_ptr<Message> msg;
-private:
+    std::vector<std::unique_ptr<Message>> pendingMsgs;
     bool delayed = false;
 
    void shrinkUntil(int index) {
@@ -232,8 +242,9 @@ private:
 public:
     std::future<bool> sendHeartbeat(bool done) {
        if (!delayed) {
-           msg = std::make_unique<HeartBeat>(done);
-           auto msg_p = msg.get();
+           auto msg = std::make_unique<HeartBeat>(done);
+           Message *msg_p = msg.get();
+           pendingMsgs.push_back(std::move(msg));
            co_await channelToLeader.write(msg_p);
            co_return true;
        } else {
@@ -255,8 +266,9 @@ public:
     }
 
     std::future<bool> sendAppendEntriesReq(AppendEntriesReq &&req) {
-        msg = std::make_unique<AppendEntriesReq>(req);
-        auto msg_p = msg.get();
+        auto msg = std::make_unique<AppendEntriesReq>(req);
+        Message *msg_p = msg.get();
+        pendingMsgs.push_back(std::move(msg));
         co_await channelToLeader.write(msg_p);
         co_return true;
     }
@@ -267,8 +279,9 @@ public:
     }
 
     std::future<bool> sendAppendEntriesResp(AppendEntriesResp &&rep) {
-        msg = std::make_unique<AppendEntriesResp>(rep);
-        auto msg_p = msg.get();
+        auto msg = std::make_unique<AppendEntriesResp>(rep);
+        Message *msg_p = msg.get();
+        pendingMsgs.push_back(std::move(msg));
         co_await channelToLeader.write(msg_p);
         co_return true;
     }
@@ -295,7 +308,7 @@ public:
     void run() override {
         state = State::LEADER;
         currentTerm++;
-        fmt::print("Leader of term {}\n", currentTerm);
+        fmt::print("Leader: {} of term {}\n", (void*)this, currentTerm);
         for (auto &&entry : entriesToReplicate) {
             for (auto &&follower : followers) {
                 // FIXME: do in parallel + when_all helper
@@ -404,9 +417,9 @@ private:
 
 class Candidate final : public Node {
 public:
-    Candidate(int _expectedCandidates, const std::vector<Candidate*> &_otherCandidates, const std::map<char, int> &_logState,
+    Candidate(int _expectedCandidates, const std::vector<Node*> &_otherNodes, const std::map<char, int> &_logState,
               const std::vector<MetaEntry> &_log, State _state)
-        : Node(_logState, _log, _state), expectedCandidates(_expectedCandidates), otherCandidates(_otherCandidates){}
+        : Node(_logState, _log, _state), expectedCandidates(_expectedCandidates), otherNodes(_otherNodes){}
 
     void run() override {
         state = State::CANDIDATE;
@@ -416,16 +429,18 @@ public:
         // only main happy path for now
         while (!endOfElection) {
              currentTerm++;
+             auto otherCandidates = getFilteredNodes<Candidate>(otherNodes, (Node*)me);
              if (otherCandidates.size() < expectedCandidates) {
                  fmt::print("Candidate {}: too less candidates. Wait half of election timeout to catch up\n", me);
-                 wait(rpcTimeoutMs).get();
+                 wait(rpcTimeoutMs/2).get();
                  return;
              }
              auto message = receiveRequestVoteReqOrLeaderMessage().get();
              if (message) {
-                   auto vote  = true;
+                   auto vote = true;
                    auto requestVoteReq = dynamic_cast<RequestVoteReq*>(message);
                    if (requestVoteReq) {
+                       otherCandidates = getFilteredNodes<Candidate>(otherNodes, (Node*)me);
                        auto maybeVoter = ranges::find_if(otherCandidates, [&](auto &&it){
                            return it == requestVoteReq->candidateId; });
                        auto voter = *maybeVoter;
@@ -444,6 +459,7 @@ public:
                        }
                        if (vote) {
                            fmt::print("Candidate {}: vote for {} + transition to Follower\n", me, static_cast<void*>(voter));
+                           rpcHeartbeatTimeoutMs = 200; // dirty hack
                            sendRequestVoteResp(*voter, RequestVoteResp(currentTerm, true)).get();
                            endOfElection = true;
                            state = State::FOLLOWER;
@@ -460,10 +476,12 @@ public:
                    }
              } else {
                    auto votesForMe = 0u;
+                   otherCandidates = getFilteredNodes<Candidate>(otherNodes, (Node*)me);
                    ranges::for_each(otherCandidates, [this, &votesForMe, &endOfElection, me](auto &&it){
                        int lastLogIndex = log.size() - 1;
                        auto lastLogTerm = (lastLogIndex >= 0)? log[lastLogIndex].term :0;
                        auto requestVoteReq = RequestVoteReq(currentTerm, this, lastLogIndex, lastLogTerm);
+                       assert(dynamic_cast<Candidate*>(it));
                        sendRequestVoteReq(*it, std::move(requestVoteReq)).get();
                        Message* maybeMessage = receiveRequestVoteRespOrLeaderMessage().get(); //FIXME: this?
                        if (maybeMessage == nullptr) {
@@ -494,46 +512,42 @@ public:
        co_return true;
     }
 
-    void setCandidates(const std::vector<Candidate*> &_otherCandidates) {
-        otherCandidates = _otherCandidates;
+    void setOtherNodes(const std::vector<Node*> &_otherNodes) {
+        otherNodes = _otherNodes;
     }
 
 private:
     int expectedCandidates;
-    std::vector<Candidate*> otherCandidates;
-public:
-    std::unique_ptr<Message> msg;
-private:
+    std::vector<Node*> otherNodes;
     static_assert(CoroutineChannel<channel, Message*>, "it's important for implementation to have fully preemptable "
                                                        "coroutine channel");
 public:
-    channel<Message*> _channel;
+    std::vector<std::unique_ptr<Message>> pendingMsgs;
 private:
+    channel<Message*> _channel;
 
     std::future<bool> sendRequestVoteReq(Candidate &candidate, RequestVoteReq &&requestVote) {
-        msg = std::make_unique<RequestVoteReq>(requestVote);
-        auto msg_p = msg.get();
+        pendingMsgs.push_back(std::make_unique<RequestVoteReq>(requestVote));
+        auto msg_p = pendingMsgs.back().get();
         co_await candidate._channel.write(msg_p);
         co_return true;
     }
 
     std::future<Message*> receiveRequestVoteReqOrLeaderMessage() {
-        auto timeoutMs = nextInt()*rpcTimeoutMs;
-        auto [_msg, ok] = co_await _channel.readWithTimeout(timeoutMs);
+        auto [_msg, ok] = co_await _channel.readWithTimeout(nextInt()*rpcTimeoutMs);
         assert(ok);
         co_return _msg;
     }
 
     std::future<bool> sendRequestVoteResp(Candidate &candidate, RequestVoteResp &&requestVoteResp) {
-        msg = std::make_unique<RequestVoteResp>(requestVoteResp);
-        auto msg_p = msg.get();
+        pendingMsgs.push_back(std::make_unique<RequestVoteResp>(requestVoteResp));
+        auto msg_p = pendingMsgs.back().get();
         co_await candidate._channel.write(msg_p);
         co_return true;
     }
 
     std::future<Message*> receiveRequestVoteRespOrLeaderMessage() {
-        auto timeoutMs = nextInt()*rpcTimeoutMs;
-        auto [_msg, ok] = co_await _channel.readWithTimeout(timeoutMs);
+        auto [_msg, ok] = co_await _channel.readWithTimeout(rpcTimeoutMs/2);
         assert(ok);
         co_return _msg;
     }
@@ -574,23 +588,17 @@ public:
             auto old_state = node->state;
             node->run();
             state = node->state;
+
             switch (state) {
                 case State::FOLLOWER: {
                     fmt::print("transform to follower\n");
-                    auto old_can = dynamic_cast<Candidate*>(me());
-                    assert(old_can);
-                    auto tmp_msg = std::move(old_can->msg);
-                    node = std::make_unique<Follower>(logState, log, state, delayed);
-                    auto new_follower = dynamic_cast<Follower*>(me());
-                    assert(new_follower);
-                    new_follower->msg = std::move(tmp_msg);
+                    auto as_candidate = dynamic_cast<Candidate*>(me());
+                    node = std::make_unique<Follower>(logState, log, state, delayed, std::move(as_candidate->pendingMsgs));
                     break;
                 }
 
                 case State::LEADER: {
-                    auto knownFollowers = boost::copy_range<std::vector<Follower*>>(otherNodes
-                        | transformed([](auto &&it){ return dynamic_cast<Follower*>(it->me()); })
-                        | filtered([](auto &&it){ return bool(it); }));
+                    auto knownFollowers = getFilteredNodes<Follower>(otherNodes, me());
                     fmt::print("transform to leader\n");
                     auto entries = maybeEntriesToReplicate? maybeEntriesToReplicate.value() : std::map<char, int>{};
                     node = std::make_unique<Leader>(knownFollowers, entries, logState, log, state);
@@ -598,15 +606,15 @@ public:
                 }
 
                 case State::CANDIDATE: {
-                    auto knownCandidates = boost::copy_range<std::vector<Candidate*>>(otherNodes
-                        | transformed([](auto &&it){ return dynamic_cast<Candidate*>(it->me()); })
-                        | filtered([this](auto &&it){ return bool(it) && it != me(); }));
-                    auto node_as_candiate = dynamic_cast<Candidate*>(node.get());
-                    if (node_as_candiate) {
-                        node_as_candiate->setCandidates(knownCandidates);
+                    auto nodes = boost::copy_range<std::vector<Node*>>(otherNodes
+                                     | transformed([](auto &&it){ return it.get(); })
+                                     | filtered([me = me()](auto &&it){ return bool(it) && it != me; }));
+                    auto as_candiate = dynamic_cast<Candidate*>(node.get());
+                    if (as_candiate) {
+                       as_candiate->setOtherNodes(nodes);
                     } else {
                         fmt::print("transform to candidate from {}\n", static_cast<unsigned>(old_state));
-                        node = std::make_unique<Candidate>(otherNodes.size() - 1, knownCandidates, logState, log, state);
+                        node = std::make_unique<Candidate>(otherNodes.size() - 1, nodes, logState, log, state);
                     }
                     break;
                 }
@@ -934,6 +942,7 @@ static void twoCandidatesInitiateElectionsOneWins() {
     auto follower2 = dynamic_cast<Follower*>(nodes.back()->me());
     assert(follower1->state == State::DONE && follower2->state == State::DONE);
     fmt::print("\n");
+    Node::rpcHeartbeatTimeoutMs = 60;
 }
 
 static void moreCandidatesInitiateElectionsOneWins() {
@@ -949,6 +958,7 @@ static void moreCandidatesInitiateElectionsOneWins() {
         assert(node->state == State::DONE);
     });
     fmt::print("\n");
+    Node::rpcHeartbeatTimeoutMs = 60;
 }
 
 static void twoCandidatesInitiateElectionsOneWinsWithConsensus() {
@@ -968,6 +978,7 @@ static void twoCandidatesInitiateElectionsOneWinsWithConsensus() {
         assert(node->state == State::DONE);
     });
     fmt::print("\n");
+    Node::rpcHeartbeatTimeoutMs = 60;
 }
 
 static void moreCandidatesInitiateElectionsOneWinsWithConsensus() {
@@ -988,6 +999,7 @@ static void moreCandidatesInitiateElectionsOneWinsWithConsensus() {
         assert(node->state == State::DONE);
     });
     fmt::print("\n");
+    Node::rpcHeartbeatTimeoutMs = 60;
 }
 
 static int getRandom(unsigned from, unsigned to) {
@@ -998,19 +1010,19 @@ static int getRandom(unsigned from, unsigned to) {
 }
 
 static std::vector<MetaEntry> generateRandomLog(unsigned size, int maxTerm)  {
-    //using namespace boost::adaptors;
+    using namespace boost::adaptors;
     auto randomLog = std::vector<MetaEntry>();
     for (auto _ : boost::irange(0u, size)) {
         auto i = getRandom(1, maxTerm); _;
         randomLog.push_back(MetaEntry{std::tuple{'a', i}, i});
     }
-#if 0 // FIXME
     boost::sort(randomLog);
-#endif
     return randomLog;
 }
 
 static void stressTest() {
+    cooperative_scheduler::debug = false;
+    ::debug = false;
     using namespace boost::adaptors;
     const auto logSize = 10u;
     auto logToPoison = generateRandomLog(logSize, 10u);
@@ -1022,7 +1034,7 @@ static void stressTest() {
         auto follower = std::make_unique<Server>(Instance::ARTIFICIAL_FOLLOWER, std::nullopt, nodes, false, delayRandomly);
         auto afollower = dynamic_cast<ArtificialFollower*>(follower->me());
         auto filteredLog = boost::copy_range<std::vector<MetaEntry>>(logToPoison | filtered([](auto &&){
-                                return static_cast<bool>(getRandom(0u, 1u)); }));
+                                return static_cast<bool>(getRandom(1u, 1u)); }));
         afollower->poison(1, filteredLog);
         nodes.push_back(std::move(follower));
     }
@@ -1059,10 +1071,10 @@ int main() {
    Node::rpcHeartbeatTimeoutMs = 60;
    oneFailingLeaderOneFollowerScenarioWithConsensus();
    twoCandidatesInitiateElectionsOneWins();
-
-   //moreCandidatesInitiateElectionsOneWins();
    twoCandidatesInitiateElectionsOneWinsWithConsensus();
-   //moreCandidatesInitiateElectionsOneWinsWithConsensus();
-   //stressTest();
+   // TODO: those 3 below still sometimes fails
+   moreCandidatesInitiateElectionsOneWins();
+   moreCandidatesInitiateElectionsOneWinsWithConsensus();
+   stressTest();
    return 0;
 }

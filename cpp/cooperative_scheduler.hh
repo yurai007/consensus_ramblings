@@ -187,4 +187,4 @@ private:
 cooperative_scheduler* cooperative_scheduler::just_me = nullptr;
 volatile bool cooperative_scheduler::by_interrupt = false;
 bool cooperative_scheduler::debug = true;
-int cooperative_scheduler::timer_us = (debug)? 33'000 : 10'000; // 33ms or 10ms
+int cooperative_scheduler::timer_us = (debug)? 10'000 : 5'000; // 10ms or 5ms
